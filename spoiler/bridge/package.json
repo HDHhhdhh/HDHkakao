@@ -1,0 +1,25 @@
+{
+  "name": "spoiler-loco-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only KakaoTalk companion bridge for Spoiler",
+  "type": "module",
+  "main": "dist/spoiler-bridge.mjs",
+  "bin": {
+    "spoiler-bridge": "dist/spoiler-bridge.mjs",
+    "spoiler-auth": "dist/spoiler-auth.mjs"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "agent-messenger": "2.37.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  },
+  "engines": {
+    "node": "24.19.0"
+  }
+}

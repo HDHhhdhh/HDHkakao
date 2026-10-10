@@ -1,0 +1,2 @@
+# Reproduce the validated Windows runtime instead of resolving newer versions.
+-r requirements.lock.txt

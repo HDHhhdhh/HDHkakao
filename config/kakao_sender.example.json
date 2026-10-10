@@ -1,0 +1,111 @@
+{
+  "search_box": {
+    "x": 0,
+    "y": 0
+  },
+  "app_titles": [
+    "KakaoTalk",
+    "카카오톡"
+  ],
+  "close_chat_key": [
+    "alt",
+    "f4"
+  ],
+  "clear_search_key": "",
+  "clear_search_strategy": "select_text",
+  "exit_search_key": "esc",
+  "recent_list_top_key": "home",
+  "pre_clear_search_key": "",
+  "focus_before_each_search": true,
+  "require_main_window_focus": true,
+  "require_window_handles": true,
+  "require_new_chat_window": true,
+  "verify_chat_title": true,
+  "allow_global_close_fallback": false,
+  "embedded_chat_close_key": "esc",
+  "non_chat_view_close_key": "esc",
+  "send_enter_presses": 2,
+  "send_enter_interval": 0.2,
+  "direct_send_batch_size": 30,
+  "direct_send_batch_pause_seconds": 2.0,
+  "delays": {
+    "after_focus": 0.5,
+    "after_click_search": 0.2,
+    "after_type_name": 0.5,
+    "after_open_chat": 1.0,
+    "after_paste_message": 0.7,
+    "after_send": 1.0,
+    "after_paste_attachments": 1.2,
+    "after_send_attachments": 1.4,
+    "after_close": 0.8,
+    "after_clear_search": 0.4,
+    "after_recent_top": 0.2,
+    "after_open_schedule_menu": 0.4,
+    "after_open_schedule_dialog": 0.8,
+    "after_schedule_field_click": 0.2,
+    "after_schedule_picker": 0.3,
+    "after_schedule_submit": 1.0
+  },
+  "press_home_before_search": false,
+  "schedule_ui": {
+    "plus_button": {
+      "x_offset": 24,
+      "y_offset": -23
+    },
+    "plus_button_candidates": [
+      {
+        "x_offset": 36,
+        "y_offset": -42
+      },
+      {
+        "x_offset": 52,
+        "y_offset": -48
+      }
+    ],
+    "plus_button_by_chat": {
+      "대화방 제목": [
+        {
+          "x_offset": 52,
+          "y_offset": -48
+        }
+      ]
+    },
+    "reservation_menu": {
+      "x_offset": 75,
+      "y_offset": 45
+    },
+    "message_field_click": {
+      "x_offset": 176,
+      "y_offset": 170
+    },
+    "date_field": {
+      "x_offset": 155,
+      "y_offset": 450
+    },
+    "ampm_field": {
+      "x_offset": 270,
+      "y_offset": 450
+    },
+    "hour_field": {
+      "x_offset": 288,
+      "y_offset": 450
+    },
+    "minute_field": {
+      "x_offset": 321,
+      "y_offset": 450
+    },
+    "date_picker": {
+      "prev_x_offset": 36,
+      "next_x_offset": 206,
+      "month_nav_y_offset": 44,
+      "grid_x_offset": 29,
+      "grid_y_offset": 100,
+      "cell_width": 31,
+      "cell_height": 28
+    },
+    "schedule_button": {
+      "x_offset": 183,
+      "y_offset": 562
+    }
+  }
+}

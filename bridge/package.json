@@ -1,0 +1,15 @@
+{
+  "name": "kakao-talk-hub-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.19.0"
+  },
+  "scripts": {
+    "test": "node --test ../tests/test_kakao_direct_send_once.mjs ../tests/test_kakao_direct_session.mjs ../tests/test_kakao_direct_media.mjs ../tests/test_kakao_direct_reconcile.mjs ../tests/test_kakao_chat_enrichment.mjs ../tests/test_kakao_friend_aliases.mjs ../tests/test_kakao_loco_method_capture.mjs"
+  },
+  "dependencies": {
+    "agent-messenger": "2.37.1"
+  }
+}

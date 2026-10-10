@@ -1,0 +1,7 @@
+{
+  "version": "v24.19.0",
+  "platform": "win32",
+  "architecture": "x64",
+  "sha256": "3602F2BB1A10F2CBAB4C36886218A33C1AB3DB87290E73B033C46C77147D0237",
+  "source": "https://nodejs.org/dist/v24.19.0/win-x64/node.exe"
+}
