@@ -32,7 +32,7 @@ def attachment_receipt(*, text=True):
 
 
 class DirectAttachmentServiceTests(unittest.TestCase):
-    def execute(self, outcome, *, text="fixture body", direct=True, blocked=False, confirm="send"):
+    def execute(self, outcome, *, text="fixture body", direct=True, blocked=False, confirm="send", config=None):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         attachments = tuple(Path(temporary.name) / name for name in ("sensitive-name.png", "sensitive-name.pdf"))
@@ -53,7 +53,7 @@ class DirectAttachmentServiceTests(unittest.TestCase):
             send_one=Mock(), send_scheduled_one=Mock(), return_to_recent_chat_top=Mock(),
         )
         request = SendRunRequest(
-            selected=((0, row),), config={}, countdown=0, delay_scale=0,
+            selected=((0, row),), config=config or {}, countdown=0, delay_scale=0,
             common_schedule=None, continue_on_error=True, confirm_each=False,
             direct_enabled=direct, chat_mappings=(("fixture room", "100"),),
             blocked_direct_names=("fixture room",) if blocked else (),
@@ -98,6 +98,14 @@ class DirectAttachmentServiceTests(unittest.TestCase):
         self.assertNotIn("results", result)
         for private in ("sensitive-name", "private-path", "private-url", "fixture body"):
             self.assertNotIn(private, repr(result))
+
+    def test_image_file_setting_reaches_direct_bridge(self):
+        outcome = attachment_receipt()
+        outcome["results"][1]["kind"] = "file"
+        result, _, _, bridge, _ = self.execute(outcome, config={"image_send_as": "file"})
+        self.assertEqual(bridge.send_attachments.call_args.kwargs["image_send_as"], "file")
+        self.assertEqual(result["direct_photo_count"], 0)
+        self.assertEqual(result["direct_file_count"], 2)
 
     def test_attachment_only_and_blank_body_do_not_require_text_receipt(self):
         for text in ("", " \n "):

@@ -27,6 +27,7 @@
   "send_enter_presses": 2,
   "send_enter_interval": 0.2,
   "direct_send_batch_size": 30,
+  "image_send_as": "photo",
   "direct_send_batch_pause_seconds": 2.0,
   "delays": {
     "after_focus": 0.5,

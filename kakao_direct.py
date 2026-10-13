@@ -1815,6 +1815,7 @@ class KakaoDirectBridge:
         chat_id: str | None = None,
         attachments: tuple[Path, ...] | list[Path],
         attachment_run_id: str | None = None,
+        image_send_as: str = "photo",
     ) -> dict[str, Any]:
         """Send optional text then each attachment, once, through LOCO.
 
@@ -1825,6 +1826,8 @@ class KakaoDirectBridge:
             raise DirectSendDisabledError()
         if not isinstance(text, str):
             raise DirectSendError(code="invalid_media_request")
+        if image_send_as not in ("photo", "file"):
+            raise DirectSendError(code="invalid_image_send_as")
         if attachment_run_id is not None:
             self._validate_attachment_run_id(attachment_run_id)
         paths = validate_direct_attachments(attachments)
@@ -1838,9 +1841,11 @@ class KakaoDirectBridge:
         }
         if attachment_run_id is not None:
             request_arguments["attachment_run_id"] = attachment_run_id
+        if image_send_as != "photo":
+            request_arguments["imageSendAs"] = image_send_as
         result = self._request_send_with_auth_recovery("send_attachments", timeout=request_timeout, **request_arguments)
         expected_kinds = (["text"] if text.strip() else []) + [
-            "photo" if path.suffix.lstrip(".").lower() in _DIRECT_PHOTO_EXTENSIONS else "file" for path in paths
+            "photo" if image_send_as == "photo" and path.suffix.lstrip(".").lower() in _DIRECT_PHOTO_EXTENSIONS else "file" for path in paths
         ]
         receipts = result.get("results")
         if (not isinstance(receipts, list) or len(receipts) != len(expected_kinds)
