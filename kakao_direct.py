@@ -1781,7 +1781,7 @@ class KakaoDirectBridge:
         *,
         attachments: tuple[Path, ...] | list[Path],
         attachment_run_id: str,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Validate frozen run files and retain bounded, reusable media buffers.
 
         This command performs local file work only; it never logs in or sends.
@@ -1799,6 +1799,7 @@ class KakaoDirectBridge:
                 or type(result.get("total_bytes")) is not int
                 or not 0 < result["total_bytes"] <= MAX_DIRECT_ATTACHMENT_TOTAL_BYTES):
             raise DirectBridgeError(code="invalid_attachment_preparation")
+        return result
 
     def release_attachments(self, attachment_run_id: str) -> None:
         """Release one run's prepared buffers without starting a closed child."""

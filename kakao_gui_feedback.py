@@ -231,6 +231,8 @@ class HubRunFeedbackMixin:
             self.handle_send_run_event(payload)
         elif event == "diagnostic_result":
             self.handle_diagnostic_result(payload)
+        elif event == "attachment_dimensions":
+            self.handle_attachment_dimensions(payload)
         elif event == "recovery_offer_result":
             self.handle_recovery_offer_result(payload)
         elif event == "run_history_result":
