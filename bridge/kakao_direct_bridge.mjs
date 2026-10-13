@@ -1141,7 +1141,8 @@ async function commandPrepareAttachments(request) {
   // Local preflight only. No login/session acquisition or network mutation.
   const attachments = await attachmentCache.prepare(request.attachment_run_id, request.attachments,
     sdk.detectImageDimensions);
-  return { attachment_count: attachments.length, total_bytes: attachments.reduce((total, item) => total + item.data.length, 0) };
+  return { attachment_count: attachments.length, total_bytes: attachments.reduce((total, item) => total + item.data.length, 0),
+    attachments: attachments.map(item => item.kind === "photo" ? { width: item.width, height: item.height } : {}) };
 }
 
 function commandReleaseAttachments(request) {

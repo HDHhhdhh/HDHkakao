@@ -23,6 +23,8 @@ from tkinter.scrolledtext import ScrolledText
 from kakao_gui_theme import configure_hub_style
 from kakao_gui_text import KoreanLabel
 
+SMALL_IMAGE_WARNING_THRESHOLD_PX: Final = 700
+
 from kakao_app_paths import SCHEDULE_JOURNAL_PATH
 from kakao_schedule_capacity import ScheduleCapacity
 from kakao_schedule_journal import ScheduleJournal
@@ -2011,7 +2013,52 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         for path in shared:
             prefix = "이미지" if is_image_path(path) else "파일"
             self.attachment_list.insert("end", f"{prefix} · {path.name}")
-        self.attachment_help.configure(text=format_attachment_panel_help(shared))
+        help_text = format_attachment_panel_help(shared)
+        if shared == self.__dict__.get("_attachment_dimensions_paths"):
+            for path, item in zip(shared, self.__dict__.get("_attachment_dimensions", ())):
+                width, height = item.get("width"), item.get("height")
+                if type(width) is int and type(height) is int and width > 0 and height > 0:
+                    detail = f"{path.name}: {width}x{height}"
+                    if width < SMALL_IMAGE_WARNING_THRESHOLD_PX or height < SMALL_IMAGE_WARNING_THRESHOLD_PX:
+                        detail += " - 수신 화면에서 흐리게 보일 수 있음"
+                    help_text += "\n" + detail
+        self.attachment_help.configure(text=help_text)
+        if (any(is_image_path(path) for path in shared)
+                and shared != self.__dict__.get("_attachment_dimensions_paths")
+                and not self.__dict__.get("_attachment_dimensions_pending")
+                and "direct_config" in self.__dict__):
+            self._attachment_dimensions_pending = True
+            config = self.direct_config.to_dict()
+            post = self.post
+
+            def worker() -> None:
+                bridge = None
+                dimensions = []
+                try:
+                    # Local preflight never logs in, reads the vault or sends.
+                    bridge = KakaoDirectBridge(config, direct_enabled=True)
+                    result = bridge.prepare_attachments(attachments=shared, attachment_run_id=uuid.uuid4().hex)
+                    dimensions = result.get("attachments", [])
+                except DirectBridgeError:
+                    pass  # Missing SDK/invalid images must not block editing or send.
+                finally:
+                    try:
+                        if bridge is not None:
+                            bridge.close()
+                    finally:
+                        post("attachment_dimensions", (shared, dimensions))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+    def handle_attachment_dimensions(self, payload: Any) -> None:
+        paths, dimensions = payload
+        self._attachment_dimensions_pending = False
+        if self.__dict__.get("_close_requested"):
+            return
+        self._attachment_dimensions_paths = paths
+        self._attachment_dimensions = dimensions
+        # A stale result is never shown; refresh can request the new paths.
+        self.refresh_attachment_panel(sync_path_input=False)
 
     def open_search_bar(self, event: tk.Event | None = None) -> str:
         self.search_frame.grid()

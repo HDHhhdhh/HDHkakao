@@ -107,7 +107,8 @@ export function detectImageDimensions(data) {
         config = DirectKakaoConfig(enabled=True, node_path=shutil.which("node"), sdk_root=entry, request_timeout=3.0)
         bridge = KakaoDirectBridge(config, credential_vault=ForbiddenVault())
         try:
-            bridge.prepare_attachments(attachments=(photo,), attachment_run_id="first-run")
+            prepared = bridge.prepare_attachments(attachments=(photo,), attachment_run_id="first-run")
+            self.assertEqual(prepared["attachments"], [{"width": 2, "height": 3}])
             photo.write_bytes(b"next snapshot")
             bridge.prepare_attachments(attachments=(photo,), attachment_run_id="first-run")
             bridge.release_attachments("first-run")
