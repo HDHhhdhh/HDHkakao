@@ -127,6 +127,8 @@ class ResponsivePanelTests(unittest.TestCase):
     def setUp(self):
         self.patches = [patch.object(panels.tk, "Toplevel", OwnerWidget),
                         patch.object(panels.tk, "StringVar", OwnerVar),
+                        # Its ttk base was bound at import time; stub the panel label too.
+                        patch.object(panels, "KoreanLabel", OwnerWidget),
                         patch.object(panels, "ScrolledText", OwnerWidget)]
         self.patches.extend(patch.object(panels.ttk, name, OwnerWidget)
                             for name in ("Label", "Combobox", "Treeview", "Frame", "Button"))
