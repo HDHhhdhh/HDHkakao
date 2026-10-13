@@ -170,7 +170,7 @@ class DirectConfigTests(unittest.TestCase):
         manifest = json.loads((project_root / "bridge" / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["dependencies"]["agent-messenger"], EXPECTED_SDK_VERSION)
 
-    def test_sdk_discovery_prefers_project_install_before_legacy(self) -> None:
+    def test_sdk_discovery_uses_only_local_install_or_override(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             installed = root / "bridge" / "node_modules" / "agent-messenger"
@@ -180,15 +180,14 @@ class DirectConfigTests(unittest.TestCase):
                 path.mkdir(parents=True)
             with (
                 patch("kakao_direct.__file__", str(root / "kakao_direct.py")),
-                patch("kakao_direct.DEFAULT_SDK_ROOT", legacy),
                 patch.dict("os.environ", {"KAKAO_AGENT_MESSENGER_ROOT": ""}),
             ):
                 self.assertEqual(discover_sdk_root(), installed)
                 installed.rmdir()
-                self.assertEqual(discover_sdk_root(), checkout)
-                checkout.rmdir()
-                self.assertEqual(discover_sdk_root(), legacy)
+                self.assertEqual(discover_sdk_root(), installed)
                 self.assertEqual(discover_sdk_root(root / "explicit"), root / "explicit")
+                with patch.dict("os.environ", {"KAKAO_AGENT_MESSENGER_ROOT": str(legacy)}):
+                    self.assertEqual(discover_sdk_root(), legacy)
 
     def test_default_direct_mode_is_off(self) -> None:
         config = DirectKakaoConfig()

@@ -48,8 +48,10 @@ except ImportError:  # pragma: no cover - exercised on non-Windows CI only.
     win32crypt = None  # type: ignore[assignment]
 
 
-DEFAULT_SDK_ROOT = Path(
-    r"C:\Users\gkseh\Documents\Codex\2026-08-28\li\work\Spoiler\bridge\node_modules\agent-messenger"
+DEFAULT_SDK_ROOT = Path(__file__).resolve().parent / "bridge" / "node_modules" / "agent-messenger"
+SDK_MISSING_MESSAGE = (
+    "agent-messenger SDK를 찾지 못했습니다. bridge/node_modules/agent-messenger에 "
+    "고정 의존성을 준비하거나 KAKAO_AGENT_MESSENGER_ROOT를 설치 경로로 설정하세요."
 )
 DEFAULT_BRIDGE_SCRIPT = Path(__file__).resolve().parent / "bridge" / "kakao_direct_bridge.mjs"
 EXPECTED_SDK_VERSION = "2.37.1"
@@ -144,9 +146,9 @@ def discover_sdk_root(explicit: str | os.PathLike[str] | None = None) -> Path:
     """Resolve the agent-messenger package root used by the Node bridge.
 
     ``KAKAO_AGENT_MESSENGER_ROOT`` may point to the package directory or
-    directly to an index.js file. Project-local installations take precedence
-    over the historical Spoiler installation, which remains a compatibility
-    fallback for existing users.
+    directly to an index.js file. Without an override, only the project-local
+    bridge/node_modules installation is used. Missing SDKs fail at startup,
+    so the GUI can still load settings and display local diagnostics.
     """
 
     if explicit:
@@ -154,16 +156,7 @@ def discover_sdk_root(explicit: str | os.PathLike[str] | None = None) -> Path:
     env_root = os.environ.get("KAKAO_AGENT_MESSENGER_ROOT")
     if env_root:
         return _expand_path(env_root)
-    project_root = Path(__file__).resolve().parent
-    candidates = (
-        project_root / "bridge" / "node_modules" / "agent-messenger",
-        project_root / "agent-messenger",
-        DEFAULT_SDK_ROOT,
-    )
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return DEFAULT_SDK_ROOT
+    return Path(__file__).resolve().parent / "bridge" / "node_modules" / "agent-messenger"
 
 
 def normalize_chat_name(value: Any) -> str:
@@ -1409,6 +1402,10 @@ class KakaoDirectBridge:
             self._write_frame({"id": self._next_id("lease"), "command": "auth_lease_released",
                 "request_id": payload.get("request_id"), "ok": valid})
             return
+        if event_name == "startup_error" and payload.get("code") == "sdk_missing":
+            self._ready_info = {"startup_error": "sdk_missing"}
+            self._ready_event.set()
+            return
         if event_name == "ready":
             self._ready_info = {
                 key: value
@@ -1514,6 +1511,8 @@ class KakaoDirectBridge:
             except DirectBridgeDisconnectedError as exc:
                 if command in _MUTATION_COMMANDS:
                     raise DirectSendUnknownError(code=exc.code) from None
+                if self._ready_info.get("startup_error") == "sdk_missing":
+                    raise DirectBridgeError(SDK_MISSING_MESSAGE, code="sdk_missing") from None
                 raise
             except DirectBridgeError:
                 raise
@@ -1565,6 +1564,8 @@ class KakaoDirectBridge:
                     **{key: value for key, value in response.items() if key in {"protocol", "direct_enabled", "authenticated"}},
                 }
                 self._ready_event.set()
+            if self._ready_info.get("startup_error") == "sdk_missing":
+                raise DirectBridgeError(SDK_MISSING_MESSAGE, code="sdk_missing")
             if self._disconnected_event.is_set():
                 raise DirectBridgeDisconnectedError()
             if self._credentials is None:
