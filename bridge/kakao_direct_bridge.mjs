@@ -15,7 +15,7 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, extname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   enrichDirectChatPeerIdentities,
@@ -33,8 +33,7 @@ import { reconcileDirectTextHistory } from "./kakao_direct_reconcile.mjs";
 import { prepareAttachments, PreparedAttachmentCache, sendAttachmentsOnce } from "./kakao_direct_media.mjs";
 
 const PROTOCOL_VERSION = 1;
-const DEFAULT_SDK_ROOT =
-  "C:\\Users\\gkseh\\Documents\\Codex\\2026-08-28\\li\\work\\Spoiler\\bridge\\node_modules\\agent-messenger";
+const DEFAULT_SDK_ROOT = join(dirname(fileURLToPath(import.meta.url)), "node_modules", "agent-messenger");
 const LOCO_METHOD_PATTERN = /^[A-Z0-9_]{1,11}$/;
 const INVALID_LOCO_METHOD = "<invalid-method>";
 const LOCO_CAPTURE_WRAPPER = Symbol("kakaoSenderLocoMethodCapture");
@@ -549,7 +548,10 @@ function nextId(prefix = "evt") {
 function sdkEntry(rootValue) {
   const root = resolve(rootValue || DEFAULT_SDK_ROOT);
   if (extname(root).toLowerCase() === ".js" || extname(root).toLowerCase() === ".mjs") {
-    return root;
+    if (existsSync(root)) return root;
+    const error = new Error();
+    error.code = "sdk_missing";
+    throw error;
   }
   const candidates = [
     // agent-messenger@2.37.1 package root
@@ -560,7 +562,11 @@ function sdkEntry(rootValue) {
     join(root, "dist", "src", "platforms", "kakaotalk", "index.mjs"),
     join(root, "src", "platforms", "kakaotalk", "index.js"),
   ];
-  return candidates.find((candidate) => existsSync(candidate)) || candidates[0];
+  const entry = candidates.find((candidate) => existsSync(candidate));
+  if (entry) return entry;
+  const error = new Error();
+  error.code = "sdk_missing";
+  throw error;
 }
 
 function responseError(error, fallbackCode = "operation_failed") {
@@ -1263,8 +1269,14 @@ async function startBridge() {
     const requireFromSdk = createRequire(pathToFileURL(entry));
     BsonLong = requireFromSdk("bson").Long;
     if (typeof sdk.KakaoTalkClient !== "function") throw new Error();
-  } catch {
-    diagnostic("sdk_import_failed");
+  } catch (error) {
+    if (error?.code === "sdk_missing") {
+      frame({ event: "startup_error", code: "sdk_missing" });
+      diagnostic("sdk_missing");
+      process.stderr.write("Install agent-messenger in bridge/node_modules or set KAKAO_AGENT_MESSENGER_ROOT to its installed package/entry.\n");
+    } else {
+      diagnostic("sdk_import_failed");
+    }
     process.exitCode = 1;
     return;
   }

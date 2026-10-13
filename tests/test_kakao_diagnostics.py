@@ -92,6 +92,13 @@ class LocalDiagnosticsTests(unittest.TestCase):
         self.assertEqual(items["Node.js"].state, "error")
         runner.assert_not_called()
 
+    def test_missing_sdk_reports_environment_override(self):
+        self.config.sdk_root = self.root / "missing-sdk"
+        items, _ = self.diagnose()
+        self.assertEqual(items["직접 전송 SDK"].state, "error")
+        self.assertIn("KAKAO_AGENT_MESSENGER_ROOT", items["직접 전송 SDK"].detail)
+        self.assertIn("KAKAO_AGENT_MESSENGER_ROOT", " ".join(connection_guidance("sdk_missing")))
+
     def test_node_timeout_and_untrusted_output_have_safe_diagnostics(self):
         with patch("kakao_diagnostics.subprocess.run", side_effect=subprocess.TimeoutExpired(
             "node", 3, output="password=DO-NOT-ECHO",

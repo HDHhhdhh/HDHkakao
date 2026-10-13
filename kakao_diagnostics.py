@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from kakao_direct import DirectKakaoConfig, EXPECTED_SDK_VERSION
+from kakao_direct import DirectKakaoConfig, EXPECTED_SDK_VERSION, SDK_MISSING_MESSAGE
 from kakao_tablet_reauth import default_account_vault_path
 
 
@@ -74,7 +74,7 @@ def _sdk_item(config: DirectKakaoConfig) -> DiagnosticItem:
         configured = Path(config.sdk_root)
         package = _sdk_package(configured)
         if package is None:
-            return DiagnosticItem("직접 전송 SDK", "error", f"agent-messenger 설치를 찾지 못했습니다. bridge 폴더에서 고정 의존성을 설치하거나 SDK 경로를 확인하세요. · {configured}")
+            return DiagnosticItem("직접 전송 SDK", "error", f"{SDK_MISSING_MESSAGE} · {configured}")
         if package.stat().st_size > 1024 * 1024:
             return DiagnosticItem("직접 전송 SDK", "error", "SDK package.json 크기가 비정상입니다. 설치를 확인하세요.")
         payload = json.loads(package.read_text(encoding="utf-8"))
@@ -167,7 +167,9 @@ def connection_guidance(code: str | None) -> tuple[str, ...]:
             "직접 전송 성공 여부를 확정할 수 없습니다.",
             "카카오톡 대화방에서 실제 도착 여부를 먼저 확인하세요. 이 항목은 기본 재전송 대상에서 제외됩니다.",
         )
-    if code in {"sdk_version_mismatch", "sdk_missing", "node_missing"}:
+    if code == "sdk_missing":
+        return ("직접 전송 SDK가 설치되지 않았습니다.", SDK_MISSING_MESSAGE)
+    if code in {"sdk_version_mismatch", "node_missing"}:
         return (
             "직접 전송 실행 환경을 확인해야 합니다.",
             f"로컬 진단에서 Node.js와 agent-messenger {EXPECTED_SDK_VERSION} 설치 경로를 확인하세요.",
