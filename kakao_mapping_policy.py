@@ -159,6 +159,16 @@ def is_confirmed_mapping_label(chat_id: str, label: str | None) -> bool:
 
 
 _KOREAN_PERSON_NAME = re.compile(r"^[가-힣]{2,5}$")
+_PARENT_ROLE_LABELS: Final = frozenset({
+    "어머님", "어머니", "엄마", "아버님", "아버지", "아빠", "부모님", "학부모", "보호자",
+})
+
+
+def _is_korean_person_name(value: str) -> bool:
+    # A shared role is not a person identity. Treating every final "어머님"
+    # as the same person makes unrelated parent rows collide before even
+    # their exact labels or previously confirmed stable IDs are checked.
+    return value not in _PARENT_ROLE_LABELS and bool(_KOREAN_PERSON_NAME.fullmatch(value))
 
 
 def structured_direct_chat_aliases(value: Any) -> tuple[str, ...]:
@@ -182,11 +192,11 @@ def structured_direct_chat_aliases(value: Any) -> tuple[str, ...]:
     if not normalized:
         return ()
     aliases: list[str] = []
-    if normalized.endswith("t") and _KOREAN_PERSON_NAME.fullmatch(normalized[:-1]):
+    if normalized.endswith("t") and _is_korean_person_name(normalized[:-1]):
         aliases.append(normalized[:-1])
 
     parts = normalized.split()
-    if len(parts) >= 2 and _KOREAN_PERSON_NAME.fullmatch(parts[-1]):
+    if len(parts) >= 2 and _is_korean_person_name(parts[-1]):
         prefix = " ".join(parts[:-1])
         if any(char.isdigit() for char in prefix) or (prefix.startswith("[") and "]" in prefix):
             aliases.append(parts[-1])
@@ -205,7 +215,7 @@ def direct_chat_person_identities(value: Any) -> tuple[str, ...]:
     if not normalized:
         return ()
     identities = list(structured_direct_chat_aliases(normalized))
-    if _KOREAN_PERSON_NAME.fullmatch(normalized):
+    if _is_korean_person_name(normalized):
         identities.insert(0, normalized)
     return tuple(dict.fromkeys(identities))
 
@@ -221,13 +231,13 @@ def canonical_handoff_owner_identity(value: Any) -> str:
     """
 
     normalized = normalize_chat_match_name(value)
-    if _KOREAN_PERSON_NAME.fullmatch(normalized):
+    if _is_korean_person_name(normalized):
         return normalized
     parts = normalized.split()
     if (
         len(parts) == 2
         and parts[0].isdigit()
-        and _KOREAN_PERSON_NAME.fullmatch(parts[1])
+        and _is_korean_person_name(parts[1])
     ):
         return parts[1]
     return ""

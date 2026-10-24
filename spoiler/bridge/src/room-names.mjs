@@ -1,4 +1,5 @@
 import { Long } from 'bson';
+import { isMissingChannelInfo, readDirectRoomMetadataForClient } from '../../../bridge/kakao_direct_metadata.mjs';
 
 const MAX_ID = 9223372036854775807n;
 const SOURCES = Object.freeze({ account: 'synced_room_name', friend: 'synced_friend_name',
@@ -96,7 +97,7 @@ function aliasMap(body, maxAliases) {
 
 /**
  * Read-only metadata owner for one authenticated Spoiler session. It never
- * logs raw responses, persists credentials, opens rooms, or marks messages read.
+ * logs raw responses, persists credentials, creates rooms, or marks messages read.
  * meta.name is the server's account setting; unsynchronized PC-only names are
  * not inferred from public nicknames or claimed to be identical.
  */
@@ -238,16 +239,28 @@ export function createRoomNameResolver({ client, credentials, onMetadata = () =>
       const session = await client.acquireSession();
       if (!owned(job) || typeof session?.getChannelInfo !== 'function') return null;
       // Pinned SDK acquireSession() returns LocoSession itself, not SessionState.
-      const info = checkedInfo(await session.getChannelInfo(Long.fromString(job.chatId)), job.chatId);
-      if (!info || !owned(job)) return owned(job) ? previous?.chatTitle ?? null : null;
+      const response = await session.getChannelInfo(Long.fromString(job.chatId));
+      let info = checkedInfo(response, job.chatId);
+      let fallbackView = null;
+      if (!info && owned(job) && ownId && isMissingChannelInfo(response)) {
+        const verified = await readDirectRoomMetadataForClient(() => client, Long, job.chatId, ownId,
+          { isActive: () => owned(job) });
+        const peer = verified.snapshot.members.find(member => member.user_id !== ownId);
+        fallbackView = { peer: peer.user_id, others: [{ id: peer.user_id, name: displayName(peer.nickname) }] };
+      }
+      if ((!info && !fallbackView) || !owned(job)) return owned(job) ? previous?.chatTitle ?? null : null;
+      const completeChannelInfo = !!info;
+      info = info ?? {};
       let chatTitle = displayName(record(info.meta)?.name);
       let titleSource = chatTitle ? SOURCES.account : null;
       const rawMeta = info.meta;
       const accountChecked = rawMeta === undefined || rawMeta === null
         || (record(rawMeta) && (rawMeta.name === undefined || rawMeta.name === null
           || emptyName(rawMeta.name) || chatTitle !== null));
-      let authoritative = !!accountChecked;
-      const view = memberView(info, ownId);
+      // CHATONROOM proves the peer, but does not prove that an account-specific
+      // room title was removed. It must not erase a stronger saved room name.
+      let authoritative = completeChannelInfo && !!accountChecked;
+      const view = fallbackView ?? memberView(info, ownId);
       if (!chatTitle && !['DirectChat', 'MultiChat', 'MemoChat', 'PlusChat', 'OM', 'OD'].includes(info.type)) authoritative = false;
       if (!chatTitle && info.type === 'DirectChat' && !view?.peer) authoritative = false;
       if (!chatTitle && view?.peer) {

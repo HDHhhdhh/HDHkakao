@@ -486,6 +486,11 @@ $provenanceEntries = foreach ($path in ($provenanceInputs | Sort-Object)) {
         sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 }
+$sharedMetadataPath = Join-Path (Split-Path -Parent $projectRoot) 'bridge\kakao_direct_metadata.mjs'
+$provenanceEntries += [pscustomobject]@{
+    path = '../bridge/kakao_direct_metadata.mjs'
+    sha256 = (Get-FileHash -LiteralPath $sharedMetadataPath -Algorithm SHA256).Hash.ToLowerInvariant()
+}
 $provenance = [ordered]@{
     schema = 'SpoilerBuildProvenance/1'
     node_version = $nodeVersion

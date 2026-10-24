@@ -75,3 +75,14 @@ modification time. Restart the updated Spoiler once to publish the runtime.
 The runtime payloads are content addressed; .NET Framework executable bytes
 may differ between compiler runs, so the executable hash is recorded rather
 than claiming binary-identical PE output.
+
+## Empty direct-room metadata
+
+`src/room-names.mjs` shares `../../bridge/kakao_direct_metadata.mjs` with
+KakaoSender. A `CHATINFO` body status of `-401` can occur for an empty direct
+room. This case uses two consistent `CHATONROOM` / `GETMEM` reads to prove
+the room and peer IDs before looking up the saved friend name. Other failures
+do not select this fallback. It sends no messages or read receipts.
+
+The shared module is bundled into the executable and included in build
+provenance. Keep the repository layout when building Spoiler from source.

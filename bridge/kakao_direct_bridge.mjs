@@ -27,6 +27,7 @@ import {
   fetchFriendAliasRecords,
 } from "./kakao_friend_aliases.mjs";
 import { coordinatedRefresh } from "./kakao_auth_refresh.mjs";
+import { createMetadataLookupAdapter } from "./kakao_direct_metadata.mjs";
 import { sendWriteOnce } from "./kakao_direct_send_once.mjs";
 import { sessionAcquireError } from "./kakao_direct_session.mjs";
 import { reconcileDirectTextHistory } from "./kakao_direct_reconcile.mjs";
@@ -875,10 +876,13 @@ async function commandListChats(request) {
     { complete: completeList },
   );
   if (request.resolve_peer_identities !== false) {
+    const adapter = createMetadataLookupAdapter({
+      getClient: ensureClient, LongType: BsonLong, ownUserId: credentialState?.user_id, run: withRefresh,
+    });
     enrichedChats = await enrichDirectChatPeerIdentities(
       enrichedChats,
       credentialState?.user_id,
-      (chatId) => ensureClient().getMemberSnapshot(chatId),
+      adapter.getMemberSnapshot,
       { complete: completeList },
     );
   }
@@ -972,9 +976,11 @@ async function lookupAndVerifyChatsByIds(
 }
 
 async function commandGetChatsByIds(request) {
+  const adapter = createMetadataLookupAdapter({
+    getClient: ensureClient, LongType: BsonLong, ownUserId: credentialState?.user_id, run: withRefresh,
+  });
   const result = await lookupAndVerifyChatsByIds(request.chat_ids, {
-    getChat: (chatId) => withRefresh(() => ensureClient().getChat(chatId)),
-    getMemberSnapshot: (chatId) => ensureClient().getMemberSnapshot(chatId),
+    ...adapter,
     ownUserId: credentialState?.user_id,
   });
   if (result.partial_failure) diagnostic("chat_lookup_partial");
