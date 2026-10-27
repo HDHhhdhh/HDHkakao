@@ -1,13 +1,42 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { prepareAttachments, PreparedAttachmentCache, sendAttachmentsOnce, strictReceipt, uploadMediaOnce } from "../bridge/kakao_direct_media.mjs";
+import { prepareAttachments, PreparedAttachmentCache, sendAttachmentsOnce, strictReceipt, uploadMediaOnce, imageSendAttachments } from "../bridge/kakao_direct_media.mjs";
 
 const LongType = { fromString: (value) => value, ONE: "1" };
 const attachment = { filename: "sample.pdf", extension: "pdf", data: Buffer.from("%PDF-synthetic"),
   kind: "file", msgType: 18, checksum: "A".repeat(40) };
+
+test("image file opt-in preserves snapshot bytes and checksum without changing cached photo defaults", async () => {
+  const root = await mkdtemp(join(tmpdir(), "kakao-media-mode-"));
+  try {
+    const png = join(root, "crop.png");
+    const bytes = Buffer.from("original crop bytes");
+    await writeFile(png, bytes);
+    const cache = new PreparedAttachmentCache();
+    const prepared = await cache.prepare("run", [png], () => ({ width: 320, height: 140, mimeType: "image/png" }));
+    for (const [mode, msgType] of [[undefined, 2], ["photo", 2], ["file", 18]]) {
+      const [item] = imageSendAttachments(prepared, mode);
+      assert.equal(item.msgType, msgType);
+      assert.equal(item.kind, msgType === 2 ? "photo" : "file");
+      assert.deepEqual(item.data, bytes);
+      assert.equal(item.checksum, createHash("sha1").update(bytes).digest("hex").toUpperCase());
+      const f = fixture({ complete: { method: "COMPLETE", statusCode: 0,
+        body: { chatLog: { logId: "901", sendAt: 1, chatId: "777", type: msgType } } } });
+      await uploadMediaOnce({ ...f.options, attachment: item });
+      assert.equal(f.calls[0][2], msgType);
+      assert.equal(f.calls.find(([method]) => method === "POST")[1].t, msgType);
+      assert.equal(f.calls.find(([method]) => method === "bytes")[2], item.checksum);
+    }
+    assert.equal(prepared[0].msgType, 2);
+    assert.throws(() => imageSendAttachments(prepared, "invalid"), { code: "invalid_image_send_as" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("text and media receipts share the same lossless ID and integer timestamp contract", () => {
   const receipt = { success: true, status_code: 0, chat_id: "777", log_id: "901", sent_at: 1788800000 };
@@ -32,7 +61,7 @@ function fixture(options = {}) {
       return options.post ?? { statusCode: 0, body: { o: 0 } };
     },
     async writeRaw(data) {
-      calls.push(["bytes", data.length]);
+      calls.push(["bytes", data.length, createHash("sha1").update(data).digest("hex").toUpperCase()]);
       if (options.writeError) throw new Error("PRIVATE");
       if (!options.noComplete) this.push(options.complete ?? { method: "COMPLETE", statusCode: 0,
         body: { chatLog: { logId: String(901 + uploadIndex++), sendAt: 1788800000, chatId: "777", type: 18 } } });

@@ -31,7 +31,7 @@ import { createMetadataLookupAdapter } from "./kakao_direct_metadata.mjs";
 import { sendWriteOnce } from "./kakao_direct_send_once.mjs";
 import { sessionAcquireError } from "./kakao_direct_session.mjs";
 import { reconcileDirectTextHistory } from "./kakao_direct_reconcile.mjs";
-import { prepareAttachments, PreparedAttachmentCache, sendAttachmentsOnce } from "./kakao_direct_media.mjs";
+import { prepareAttachments, PreparedAttachmentCache, sendAttachmentsOnce, imageSendAttachments } from "./kakao_direct_media.mjs";
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_SDK_ROOT = join(dirname(fileURLToPath(import.meta.url)), "node_modules", "agent-messenger");
@@ -1137,9 +1137,10 @@ async function commandSendAttachments(request) {
   const media = await loadMediaTools();
   // Read and validate ALL files before acquiring the sending session or
   // emitting the optional text. Nothing from a rejected batch is delivered.
-  const attachments = request.attachment_run_id === undefined
+  const prepared = request.attachment_run_id === undefined
     ? await prepareAttachments(request.attachments, sdk.detectImageDimensions)
     : await attachmentCache.prepare(request.attachment_run_id, request.attachments, sdk.detectImageDimensions);
+  const attachments = imageSendAttachments(prepared, request.imageSendAs);
   let session;
   try { session = await withRefresh(() => ensureClient().acquireSession()); }
   catch (error) { throw sessionAcquireError(error); }

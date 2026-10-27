@@ -1,4 +1,5 @@
 """Exports use fixed snapshots and never touch Tk from a file writer."""
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 import queue
@@ -10,7 +11,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from kakao_document import rows_to_csv_text
-from kakao_gui_exports import ExportResult, HubExportsMixin
+from kakao_gui_exports import ExportResult, HubExportsMixin, _ExportRequest, _write_export
 from kakao_gui_feedback import HubRunFeedbackMixin
 from kakao_sender import MessageRow
 
@@ -81,7 +82,7 @@ def test_slow_csv_write_returns_early_and_uses_immutable_owner_snapshot():
     try:
         with patch("kakao_gui_exports.filedialog.asksaveasfilename", side_effect=choose_path(app, "preview.csv")) as chooser, \
              patch("kakao_gui_exports.rows_to_csv_text", side_effect=convert), \
-             patch.object(Path, "write_text", write):
+             patch("kakao_gui_exports._write_csv_atomically", side_effect=write):
             started = time.perf_counter()
             assert app.request_preview_csv_export()
             assert time.perf_counter() - started < 0.5
@@ -154,7 +155,7 @@ def test_all_writes_are_fifo_and_same_path_exports_never_overlap():
             active -= 1
 
     try:
-        with patch("kakao_gui_exports.filedialog.asksaveasfilename", return_value="same.csv"), patch.object(Path, "write_text", write):
+        with patch("kakao_gui_exports.filedialog.asksaveasfilename", return_value="same.csv"), patch("kakao_gui_exports._write_csv_atomically", side_effect=write):
             assert app.request_preview_csv_export()
             assert entered.wait(3)
             app.rows = [MessageRow(2, "대상", "두 번째 저장")]
@@ -188,7 +189,7 @@ def test_close_does_not_cancel_accepted_writes_or_render_late_completion():
         writes.append((path, text))
 
     try:
-        with patch("kakao_gui_exports.filedialog.asksaveasfilename", side_effect=["first.csv", "second.csv"]), patch.object(Path, "write_text", write):
+        with patch("kakao_gui_exports.filedialog.asksaveasfilename", side_effect=["first.csv", "second.csv"]), patch("kakao_gui_exports._write_csv_atomically", side_effect=write):
             app.request_preview_csv_export()
             assert entered.wait(3)
             app.request_preview_csv_export()
@@ -213,7 +214,8 @@ def test_failed_write_reports_exact_error_and_never_reports_success(kind):
     app = ExportHost()
     request = app.request_preview_csv_export if kind == "csv" else app.request_visible_log_export
     with patch("kakao_gui_exports.filedialog.asksaveasfilename", return_value="failed.txt"), \
-         patch.object(Path, "mkdir"), patch.object(Path, "write_text", side_effect=OSError("fixture disk full")):
+         patch.object(Path, "mkdir"), patch.object(Path, "write_text", side_effect=OSError("fixture disk full")), \
+         patch("kakao_gui_exports._write_csv_atomically", side_effect=OSError("fixture disk full")):
         assert request()
         result = app.take_result()
     with patch("kakao_gui_exports.messagebox.showerror") as error:
@@ -227,7 +229,7 @@ def test_failed_write_reports_exact_error_and_never_reports_success(kind):
 
 def test_duplicate_unknown_or_mismatched_completion_cannot_change_ui():
     app = ExportHost()
-    with patch("kakao_gui_exports.filedialog.asksaveasfilename", return_value="current.csv"), patch.object(Path, "write_text"):
+    with patch("kakao_gui_exports.filedialog.asksaveasfilename", return_value="current.csv"), patch("kakao_gui_exports._write_csv_atomically"):
         app.request_preview_csv_export()
         result = app.take_result()
     before = list(app.logs)
@@ -247,7 +249,7 @@ def test_duplicate_unknown_or_mismatched_completion_cannot_change_ui():
 def test_feedback_dispatch_and_active_poll_follow_pending_export_commit():
     app = ExportHost()
     assert app._feedback_work_active() is False
-    with patch("kakao_gui_exports.filedialog.asksaveasfilename", return_value="queued.csv"), patch.object(Path, "write_text"):
+    with patch("kakao_gui_exports.filedialog.asksaveasfilename", return_value="queued.csv"), patch("kakao_gui_exports._write_csv_atomically"):
         assert app.request_preview_csv_export()
         result = app.take_result()
     assert app._feedback_work_active() is True
@@ -317,3 +319,41 @@ def test_csv_and_log_bytes_equal_existing_sync_writers():
         assert csv_actual.read_bytes() == csv_expected.read_bytes()
         assert csv_actual.read_bytes().startswith(b"\xef\xbb\xbf")
         assert log_actual.read_bytes() == log_expected.read_bytes()
+
+
+@pytest.mark.parametrize("failure", ["write", "flush", "fsync", "close", "replace"])
+def test_csv_failure_preserves_previous_bytes_and_cleans_temporary_file(tmp_path, failure):
+    path = tmp_path / "previous.csv"
+    previous = b"\xef\xbb\xbfprevious\r\n"
+    path.write_bytes(previous)
+    events = []
+    request = _ExportRequest(1, "csv", path, (MessageRow(2, "대상", "새 본문"),), lambda *event: events.append(event))
+    original_factory = tempfile.NamedTemporaryFile
+
+    @contextmanager
+    def open_temporary(**kwargs):
+        with original_factory(**kwargs) as stream:
+            if failure == "write":
+                original_write = stream.write
+
+                def partial_write(text):
+                    original_write(text[:8])
+                    stream.flush()
+                    raise OSError("fixture write failure")
+
+                stream.write = partial_write
+            elif failure == "flush":
+                stream.flush = Mock(side_effect=OSError("fixture flush failure"))
+            yield stream
+        if failure == "close":
+            raise OSError("fixture close failure")
+
+    with patch("kakao_gui_exports.tempfile.NamedTemporaryFile", side_effect=open_temporary), \
+         patch("kakao_gui_exports.os.fsync", side_effect=OSError("fixture fsync failure") if failure == "fsync" else None), \
+         patch("kakao_gui_exports.os.replace", side_effect=OSError("fixture replace failure") if failure == "replace" else None):
+        _write_export(request)
+    assert path.read_bytes() == previous
+    assert list(tmp_path.iterdir()) == [path]
+    assert len(events) == 1
+    assert events[0][0] == "export_result"
+    assert events[0][1].error == f"OSError: fixture {failure} failure"

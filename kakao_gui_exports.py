@@ -4,6 +4,8 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+import os
+import tempfile
 import threading
 from tkinter import filedialog, messagebox
 from typing import Any, Callable, Literal
@@ -34,17 +36,32 @@ class ExportResult:
     error: str | None = None
 
 
+def _write_csv_atomically(path: Path, text: str, *, encoding: str) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding=encoding, dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def _write_export(request: _ExportRequest) -> None:
     error = None
     try:
         if request.kind == "csv":
             # Keep the existing writer, UTF-8 encoding, BOM, and newline rules.
             text = "\ufeff" + rows_to_csv_text(request.snapshot)
+            _write_csv_atomically(request.path, text, encoding="utf-8")
         else:
             if request.log_directory is not None:
                 request.log_directory.mkdir(parents=True, exist_ok=True)
             text = request.snapshot
-        request.path.write_text(text, encoding="utf-8")
+            request.path.write_text(text, encoding="utf-8")
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     request.post("export_result", ExportResult(request.token, request.kind, request.path, error))

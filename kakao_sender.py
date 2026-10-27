@@ -400,6 +400,8 @@ def re_match_schedule_datetime(value: str) -> datetime | None:
         return None
     year, month, day, ampm, hour, minute = match.groups()
     hour_value = int(hour)
+    if not 1 <= hour_value <= 12:
+        return None
     if ampm == "PM" and hour_value != 12:
         hour_value += 12
     if ampm == "AM" and hour_value == 12:

@@ -275,6 +275,8 @@ class SendService:
                             text=row.text, chat_id=chat_id,
                             attachments=attachment_snapshot.paths_for(row.attachments),
                             attachment_run_id=attachment_run_id,
+                            **({"image_send_as": request.config["image_send_as"]}
+                               if request.config.get("image_send_as", "photo") != "photo" else {}),
                         )
                     return direct_bridge.send_message(text=row.text, chat_id=chat_id)
                 except DirectSendNotStartedError as exc:

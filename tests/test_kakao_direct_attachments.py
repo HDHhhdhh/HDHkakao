@@ -44,6 +44,21 @@ class DirectAttachmentTests(unittest.TestCase):
         self.assertEqual(kwargs["attachments"], [str(self.pdf.resolve())])
         self.assertGreaterEqual(kwargs["timeout"], 210)
 
+    def test_image_file_opt_in_threads_mode_and_validates_file_receipt(self):
+        photo = self.pdf.with_suffix(".png")
+        photo.write_bytes(b"crop bytes")
+        for mode, kind in (("photo", "photo"), ("file", "file")):
+            last = receipt(kind)
+            self.bridge._request.return_value = {**last, "attachment_count": 1, "results": [last]}
+            result = self.bridge.send_attachments(chat_id="777", attachments=(photo,), image_send_as=mode)
+            self.assertEqual(result["results"][0]["kind"], kind)
+            self.assertEqual(self.bridge._request.call_args.kwargs.get("imageSendAs", "photo"), mode)
+        self.bridge.ready.reset_mock()
+        with self.assertRaises(DirectSendError) as raised:
+            self.bridge.send_attachments(chat_id="777", attachments=(photo,), image_send_as="invalid")
+        self.assertEqual(raised.exception.code, "invalid_image_send_as")
+        self.bridge.ready.assert_not_called()
+
     def test_run_preparation_is_local_only_and_passes_explicit_run_identity(self):
         self.bridge._request.return_value = {"attachment_count": 1, "total_bytes": self.pdf.stat().st_size}
         self.bridge.prepare_attachments(attachments=(self.pdf,), attachment_run_id="run-1")

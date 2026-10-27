@@ -135,6 +135,24 @@ class DynamicScheduleTimeTests(unittest.TestCase):
 
 
 class ScheduleLeadTimeTests(unittest.TestCase):
+    def test_ampm_hours_must_be_between_one_and_twelve(self):
+        for marker in ("오전", "오후"):
+            for hour in (0, 13, 23):
+                with self.subTest(marker=marker, hour=hour), self.assertRaises(ValueError):
+                    parse_schedule_datetime(f"2099년 10월 28일 {marker} {hour}시 00분")
+
+    def test_valid_ampm_and_twenty_four_hour_times_remain_supported(self):
+        for marker, hours in (("오전", {1: 1, 11: 11, 12: 0}), ("오후", {1: 13, 11: 23, 12: 12})):
+            for hour, expected in hours.items():
+                with self.subTest(marker=marker, hour=hour):
+                    self.assertEqual(
+                        parse_schedule_datetime(f"2099년 10월 28일 {marker} {hour}시 00분"),
+                        datetime(2099, 10, 28, expected),
+                    )
+        for hour in (0, 13, 23):
+            with self.subTest(hour=hour):
+                self.assertEqual(parse_schedule_datetime(f"2099-10-28 {hour:02}:00"), datetime(2099, 10, 28, hour))
+
     def test_form_default_uses_the_same_five_minute_lead_time(self):
         self.assertEqual(default_schedule_time(datetime(2026, 9, 28, 12, 58)), datetime(2026, 9, 28, 13, 5))
         self.assertEqual(default_schedule_time(datetime(2026, 9, 28, 12, 58, 1)), datetime(2026, 9, 28, 13, 5))

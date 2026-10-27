@@ -107,6 +107,12 @@ export async function prepareAttachments(paths, detectImageDimensions) {
   return prepared;
 }
 
+export function imageSendAttachments(attachments, imageSendAs = "photo") {
+  if (imageSendAs !== "photo" && imageSendAs !== "file") throw failure("invalid_image_send_as");
+  return attachments.map(item => imageSendAs === "file" && item.kind === "photo"
+    ? { ...item, msgType: 18, kind: "file" } : item);
+}
+
 function validRunId(runId) {
   if (typeof runId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(runId)) throw failure("invalid_attachment_run_id");
   return runId;
