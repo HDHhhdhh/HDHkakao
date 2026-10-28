@@ -1668,7 +1668,7 @@ class KakaoDirectBridge:
             return []
         return [_sanitize_chat_record(item) for item in records if isinstance(item, Mapping)]
 
-    def get_chats_by_ids(self, chat_ids: Any) -> list[dict[str, Any]]:
+    def get_chats_by_ids(self, chat_ids: Any, *, resolve_friend_aliases: bool = False) -> list[dict[str, Any]]:
         """Fetch and sanitize a bounded set of stable chat IDs.
 
         This is a read-only recovery path for rooms omitted by ``list_chats``.
@@ -1708,11 +1708,16 @@ class KakaoDirectBridge:
             "get_chats_by_ids",
             timeout=max(self.config.request_timeout, PEER_IDENTITY_REQUEST_TIMEOUT),
             chat_ids=normalized,
+            **({"resolve_friend_aliases": True} if resolve_friend_aliases else {}),
         )
         records = result.get("chats", result.get("value", result)) if isinstance(result, Mapping) else result
         if not isinstance(records, list):
             return []
         return [_sanitize_chat_record(item) for item in records if isinstance(item, Mapping)]
+
+    def resolve_chat_aliases(self, chat_ids: Any) -> list[dict[str, Any]]:
+        """Reverify rooms and read exact saved friend names for unresolved targets."""
+        return self.get_chats_by_ids(chat_ids, resolve_friend_aliases=True)
 
     def _resolve_send_chat_id(self, chat_name: str | None, chat_id: str | None) -> str:
         if chat_id is not None:

@@ -261,6 +261,32 @@ def positive_numeric_chat_id(value: Any) -> str:
     return text if POSITIVE_CHAT_ID_PATTERN.fullmatch(text) else ""
 
 
+def merge_verified_chat_aliases(
+    chats: Iterable[Mapping[str, Any]], aliases: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add local names only when both snapshots identify the same unique peer."""
+    rows = [dict(chat) for chat in chats if isinstance(chat, Mapping)]
+    by_id: dict[str, list[Mapping[str, Any]]] = {}
+    counts: dict[str, int] = {}
+    for row in rows:
+        chat_id = str(row.get("chat_id", ""))
+        counts[chat_id] = counts.get(chat_id, 0) + 1
+    for row in aliases:
+        if isinstance(row, Mapping):
+            by_id.setdefault(str(row.get("chat_id", "")), []).append(row)
+    for row in rows:
+        chat_id = str(row.get("chat_id", ""))
+        fresh = by_id.get(chat_id, ())
+        if (counts[chat_id] == 1 and len(fresh) == 1 and is_one_to_one_direct_chat(row)
+                and is_one_to_one_direct_chat(fresh[0]) and confirmed_peer_name(row)
+                and confirmed_peer_name(fresh[0])
+                and row.get("peer_user_id") == fresh[0].get("peer_user_id")
+                and normalize_chat_match_name(confirmed_chat_label(row))
+                == normalize_chat_match_name(confirmed_chat_label(dict(fresh[0])))):
+            row["peer_local_names"] = list(confirmed_peer_local_names(fresh[0]))
+    return rows
+
+
 def merge_chat_snapshots(
     primary: Iterable[Mapping[str, Any]],
     supplemental: Iterable[Mapping[str, Any]],
@@ -321,6 +347,8 @@ def auto_match_chat_ids(
     chats: list[dict[str, Any]],
     existing_mappings: Mapping[Any, Any] | None = None,
     existing_mapping_labels: Mapping[Any, Any] | None = None,
+    *,
+    guarded_mapping_ids: Iterable[Any] = (),
 ) -> ChatAutoMatchResult:
     """Find only unambiguous PC-name -> current Kakao chat-ID matches.
 
@@ -343,6 +371,8 @@ def auto_match_chat_ids(
     ``DirectChat``.  No fuzzy or arbitrary substring matching is used.
     """
     request_names = list(chat_names)
+    requested_names = {normalize_chat_match_name(name) for name in request_names}
+    guarded_ids = set(normalize_guarded_mapping_ids(guarded_mapping_ids))
     # Exact labels keep priority over aliases.  Candidate-side structured
     # aliases live in a separate index so an exact ``학생개`` room still wins
     # over a different ``10917 학생개`` room for an exact-name request.
@@ -495,11 +525,21 @@ def auto_match_chat_ids(
             elif owner is not None and owner != normalized_name:
                 canonical_identity = canonical_handoff_owner_identity(owner)
                 owner_is_current_exact_label = chat_id in candidates.get(owner, set())
+                same_person = bool(person_identities) and canonical_identity in person_identities
+                verified_local_alias = bool(
+                    confirmed_peer_name(chats_by_id.get(chat_id, {}))
+                    and normalized_name in {
+                        normalize_chat_match_name(value)
+                        for value in confirmed_peer_local_names(chats_by_id.get(chat_id, {}))
+                    }
+                    and owner == normalize_chat_match_name(confirmed_chat_label(chats_by_id.get(chat_id, {})))
+                )
                 if (
-                    person_identities
-                    and canonical_identity in person_identities
+                    (same_person or verified_local_alias)
                     and owner_is_current_exact_label
                     and is_one_to_one_direct_chat(chats_by_id.get(chat_id, {}))
+                    and chat_id not in guarded_ids
+                    and owner not in requested_names
                 ):
                     mappings[name] = chat_id
                     ownership_handoffs.append(
@@ -551,6 +591,8 @@ def reconcile_chat_mappings(
     mapping_labels: Mapping[Any, Any] | None,
     chat_names: tuple[str, ...] | list[str],
     chats: list[dict[str, Any]],
+    *,
+    guarded_mapping_ids: Iterable[Any] = (),
 ) -> ChatMappingReconcileResult:
     """Reconcile mappings with a fresh list and return safe persisted state.
 
@@ -559,11 +601,9 @@ def reconcile_chat_mappings(
     entries remain valid by stable ID when either the tablet reports a real
     label or a previously verified mapping label is saved.  The latter also
     protects confirmed mappings from a partial ``list_chats`` response.
-    Entries with no current or persisted verification are removed. Requested
-    ambiguous/unmatched entries without a valid existing mapping are also
-    removed so the next preflight can try the PC-window fallback or leave them
-    for exception review. Returned mappings are normalized and contain no
-    duplicate chat ID.
+    Entries with no current or persisted verification are removed. Ambiguous
+    reads retain previously confirmed owners, but cannot authorize a send.
+    Returned mappings are normalized and contain no duplicate chat ID.
     """
 
     current_mappings = normalize_mappings(mappings or {})
@@ -573,14 +613,19 @@ def reconcile_chat_mappings(
         chats,
         existing_mappings=current_mappings,
         existing_mapping_labels=current_labels,
+        guarded_mapping_ids=guarded_mapping_ids,
     )
 
-    # Drop every invalid persisted entry first, then drop unresolved requested
-    # names.  This makes an auto refresh conservative: a stale mapping cannot
-    # remain usable merely because a previous session saved it.
+    # Remove invalid records, not known owners absent from a partial read.
     names_to_remove = set(result.invalidated)
-    names_to_remove.update(result.ambiguous)
-    names_to_remove.update(result.unmatched)
+    # Ambiguity in a partial read is not evidence that a saved owner was
+    # deleted. Keep its ID and original label for a later fresh verification.
+    # The preflight still rejects unresolved identities; persistence is not
+    # permission to send.
+    for name in (*result.ambiguous, *result.unmatched):
+        chat_id = resolve_chat_mapping(current_mappings, name)
+        if not is_confirmed_mapping_label(chat_id, current_labels.get(chat_id)):
+            names_to_remove.add(name)
     for raw_name in names_to_remove:
         normalized = normalize_chat_match_name(raw_name)
         for key in list(current_mappings):
@@ -999,6 +1044,7 @@ def unverified_alias_mapping_names(
     automatic/group-room behavior.
     """
 
+    chat_names = tuple(chat_names)
     try:
         safe_mappings = normalize_mappings(mappings or {})
         safe_labels = normalize_mapping_labels(mapping_labels or {})
@@ -1017,8 +1063,17 @@ def unverified_alias_mapping_names(
         rows_by_id.setdefault(chat_id, []).append(chat)
 
     failures: list[str] = []
+    identity_check = auto_match_chat_ids(
+        tuple(chat_names), [dict(row) for rows in rows_by_id.values() for row in rows],
+        existing_mappings=safe_mappings, existing_mapping_labels=safe_labels,
+        guarded_mapping_ids=guarded_ids,
+    )
+    blocked_names = set(identity_check.ambiguous) | set(identity_check.invalidated)
     for raw_name in chat_names:
         name = str(raw_name).strip()
+        if name in blocked_names:
+            failures.append(name)
+            continue
         normalized_name = normalize_chat_match_name(name)
         chat_id = resolve_chat_mapping(safe_mappings, name)
         saved_label = safe_labels.get(chat_id, "") if chat_id else ""

@@ -301,6 +301,7 @@ def build_refresh_plan(
         config.mapping_labels,
         list(target_names),
         chats,
+        guarded_mapping_ids=config.guarded_mapping_ids,
     )
     target_normalized = set(normalize_manual_chat_targets(target_names))
     final_mappings = dict(config.mappings)

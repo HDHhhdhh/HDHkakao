@@ -66,7 +66,7 @@ class DirectGuiHelpersTests(unittest.TestCase):
     def setUp(self):
         # GUI worker tests use synthetic catalogs. Direct provider tests below
         # call their imported functions with explicit fake providers instead.
-        for target in ("discover_pc_chat_catalog_ids", "discover_open_pc_chat_ids"):
+        for target in ("discover_pc_chat_catalog_ids", "discover_open_pc_chat_ids", "record_matching_diagnostic"):
             controller = patch(f"kakao_gui_matching.{target}", return_value=())
             controller.start()
             self.addCleanup(controller.stop)
@@ -970,9 +970,14 @@ class DirectGuiHelpersTests(unittest.TestCase):
             [{"chat_id": "new-id", "title": "저장된방", "display_name": ""}],
         )
 
-        self.assertEqual(result.mappings, {})
-        self.assertEqual(result.mapping_labels, {})
+        self.assertEqual(result.mappings, {"저장된방": "old-id"})
+        self.assertEqual(result.mapping_labels, {"old-id": "저장된방"})
+        self.assertEqual(result.matched, ())
         self.assertEqual(result.ambiguous, ("저장된방",))
+        self.assertEqual(unverified_alias_mapping_names(
+            ("저장된방",), result.mappings, result.mapping_labels,
+            [{"chat_id": "new-id", "title": "저장된방", "display_name": ""}],
+        ), ("저장된방",))
         self.assertEqual(result.invalidated, ())
 
     def test_auto_match_preserves_previous_pc_label_for_blank_tablet_chat(self):
@@ -1714,7 +1719,7 @@ class DirectGuiHelpersTests(unittest.TestCase):
         app.post = lambda event, payload: (posted.append((event, payload)), finished.set())
 
         with patch("kakao_sender_gui.KakaoDirectBridge", Bridge):
-            self.assertTrue(app.request_auto_chat_matches(("현재 저장 대상",), reason="before_send"))
+            self.assertTrue(app.request_auto_chat_matches(("현재 저장 대상",), reason="mode_change"))
             self.assertTrue(finished.wait(2))
 
         event, payload = posted[0]
@@ -3836,6 +3841,31 @@ class DirectGuiHelpersTests(unittest.TestCase):
             selected,
             blocked_direct_names=("수동 필요",),
         )
+
+    def test_saved_room_missing_from_server_does_not_open_remapping_or_exclude_recipient(self):
+        app = KakaoSenderApp.__new__(KakaoSenderApp)
+        selected = [(0, MessageRow(2, "저장된 별칭", "one"))]
+        app.rows = [row for _, row in selected]
+        app.direct_mappings = {"저장된 별칭": "101"}
+        app.direct_mapping_labels = {"101": "상대 이름"}
+        app.guarded_mapping_ids = ("101",)
+        app._latest_chat_snapshot = (self._manual_direct("202"),)
+        app.direct_names_for_selected = lambda _: ("저장된 별칭",)
+        app.set_auto_match_send_wait = Mock()
+        app.status_var = SimpleNamespace(set=Mock())
+        app.log = Mock()
+        app.show_manual_chat_mapping_dialog = Mock()
+        app.start_sending_after_preflight = Mock()
+        app.continue_start_after_auto_match(selected, True)
+        app.show_manual_chat_mapping_dialog.assert_not_called()
+        app.start_sending_after_preflight.assert_not_called()
+        app.set_auto_match_send_wait.assert_called_once_with(False)
+        self.assertEqual(app.direct_mappings, {"저장된 별칭": "101"})
+        self.assertIn("저장 ID 유지", app.status_var.set.call_args.args[0])
+        app._latest_chat_snapshot = ()
+        app.continue_start_after_auto_match(selected, True)
+        app.show_manual_chat_mapping_dialog.assert_not_called()
+        app.start_sending_after_preflight.assert_not_called()
 
     def test_direct_worker_excludes_unmatched_and_stops_batch_after_dispatch_failure(self):
         class Bridge:

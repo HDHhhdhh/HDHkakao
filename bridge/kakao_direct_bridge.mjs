@@ -25,6 +25,7 @@ import {
 import {
   enrichDirectChatFriendAliases,
   fetchFriendAliasRecords,
+  enrichDirectChatFriendAliasesFromPeers,
 } from "./kakao_friend_aliases.mjs";
 import { coordinatedRefresh } from "./kakao_auth_refresh.mjs";
 import { createMetadataLookupAdapter } from "./kakao_direct_metadata.mjs";
@@ -902,6 +903,24 @@ async function commandListChats(request) {
   return { chats: Array.isArray(enrichedChats) ? enrichedChats.map(sanitizeChat) : [] };
 }
 
+function retryableMetadataFailure(error) {
+  const transient = new Set([
+    "connection_closed", "transport_closed", "network_error", "request_timeout", "timeout",
+    "ECONNRESET", "EPIPE", "ETIMEDOUT", "ENETUNREACH", "EHOSTUNREACH",
+  ]);
+  let retry = false;
+  const seen = new Set();
+  for (let item = error, depth = 0; item && depth < 6 && !seen.has(item); item = item.cause, depth++) {
+    seen.add(item);
+    if (authFailure(item)) return false;
+    const status = item.serverStatus ?? item.statusCode;
+    if (Number.isSafeInteger(status) && status !== 0 && status !== -1) return false;
+    if (status === -1 || transient.has(item.code)
+        || item.responseFailureKind === "transient_or_unknown") retry = true;
+  }
+  return retry;
+}
+
 async function lookupAndVerifyChatsByIds(
   rawChatIds,
   {
@@ -909,6 +928,7 @@ async function lookupAndVerifyChatsByIds(
     getMemberSnapshot,
     ownUserId,
     concurrency = CHAT_LOOKUP_CONCURRENCY,
+    retryTransient = true,
   } = {},
 ) {
   const chatIds = normalizeChatLookupIds(rawChatIds);
@@ -921,6 +941,7 @@ async function lookupAndVerifyChatsByIds(
   const records = new Array(chatIds.length);
   let nextIndex = 0;
   let partialFailure = false;
+  const retryIds = new Set();
   const worker = async () => {
     while (nextIndex < chatIds.length) {
       const index = nextIndex;
@@ -937,9 +958,10 @@ async function lookupAndVerifyChatsByIds(
         } else {
           partialFailure = true;
         }
-      } catch {
+      } catch (error) {
         // One stale/local-only ID must not poison independently verified rooms.
         partialFailure = true;
+        if (retryTransient && retryableMetadataFailure(error)) retryIds.add(requestedChatId);
       }
     }
   };
@@ -959,10 +981,28 @@ async function lookupAndVerifyChatsByIds(
   const enrichedChats = await enrichDirectChatPeerIdentities(
     chats,
     ownUserId,
-    getMemberSnapshot,
-    { complete: true },
+    async (chatId) => {
+      try { return await getMemberSnapshot(chatId); }
+      catch (error) {
+        if (retryTransient && retryableMetadataFailure(error)) retryIds.add(chatId);
+        throw error;
+      }
+    },
+    { complete: true, concurrency },
   );
-  const sanitizedChats = Array.isArray(enrichedChats) ? enrichedChats.map(sanitizeChat) : [];
+  let sanitizedChats = Array.isArray(enrichedChats) ? enrichedChats.map(sanitizeChat) : [];
+  if (retryIds.size) {
+    // Let the initial workers drain before reconnecting failed rooms. Each
+    // retry repeats CHATINFO and the full member snapshot, at most once.
+    // No send operation uses this retry path.
+    const recovered = await lookupAndVerifyChatsByIds([...retryIds], {
+      getChat, getMemberSnapshot, ownUserId, concurrency: 1, retryTransient: false,
+    });
+    const byId = new Map(sanitizedChats.map(chat => [chat.chat_id, chat]));
+    for (const chat of recovered.chats) byId.set(chat.chat_id, chat);
+    sanitizedChats = chatIds.flatMap(id => byId.has(id) ? [byId.get(id)] : []);
+    partialFailure = sanitizedChats.length !== chatIds.length;
+  }
   const identityIncomplete = sanitizedChats.some(
     (chat) =>
       String(chat.type ?? "").trim().toLowerCase() === "directchat" &&
@@ -984,7 +1024,10 @@ async function commandGetChatsByIds(request) {
     ownUserId: credentialState?.user_id,
   });
   if (result.partial_failure) diagnostic("chat_lookup_partial");
-  return { chats: result.chats };
+  const chats = request.resolve_friend_aliases === true
+    ? await enrichDirectChatFriendAliasesFromPeers(result.chats, credentialState)
+    : result.chats;
+  return { chats };
 }
 
 function normalizeProbeChatId(value) {

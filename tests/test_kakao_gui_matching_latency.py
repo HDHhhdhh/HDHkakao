@@ -97,6 +97,11 @@ class SavedTargetLookupPolicyTests(unittest.TestCase):
 
 
 class AutoMatchingLatencyTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("kakao_gui_matching.record_matching_diagnostic")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def make_app(self, bridge, mappings=None, labels=None):
         app = KakaoSenderApp.__new__(KakaoSenderApp)
         app._auto_match_generation = 0
@@ -147,15 +152,78 @@ class AutoMatchingLatencyTests(unittest.TestCase):
         self.assertEqual(app.direct_mapping_labels, {"101": "김민수", "202": "관련 없는 방"})
         app.save_direct_settings.assert_not_called()
 
-    def test_mixed_new_target_uses_full_catalog_without_trying_saved_fast_path(self):
+    def test_mixed_new_target_verifies_saved_ids_before_full_catalog(self):
         fresh = direct_chat("101", "김민수")
         new = direct_chat("202", "이서연")
         bridge = ReadBridge([fresh], [fresh, new])
         app = self.make_app(bridge)
         payload = self.query(app, names=("김민수", "이서연"))
-        self.assertEqual([call for call in bridge.calls if call[0] in {"list", "lookup"}], [("list",)])
+        self.assertEqual([call for call in bridge.calls if call[0] in {"list", "lookup"}],
+                         [("lookup", ("101",)), ("list",)])
         self.assertEqual(payload[3], [fresh, new])
         self.assertIsNone(payload[4])
+
+    def test_mixed_roster_preserves_verified_saved_rooms_when_full_list_fails(self):
+        fresh = direct_chat("101", "김민수")
+
+        class BrokenCatalog(ReadBridge):
+            def list_chats(self):
+                super().list_chats()
+                raise DirectBridgeError("page unavailable", code="get_chats_failed")
+
+        bridge = BrokenCatalog([fresh])
+        app = self.make_app(bridge)
+        payload = self.query(app, ("김민수", "신규 대상"), reason="before_send")
+        self.assertEqual(payload[3], [fresh])
+        self.assertEqual(payload[9], "full_list_failed")
+        self.assertIsNone(payload[4])
+        self.assertEqual([c for c in bridge.calls if c[0] == "lookup"], [("lookup", ("101",))])
+
+    def test_canonical_saved_owner_is_queried_for_structured_csv_name(self):
+        fresh = direct_chat("101", "김민수")
+        bridge = ReadBridge([fresh], [])
+        app = self.make_app(bridge)
+        payload = self.query(app, ("A 시험고1 김민수",))
+        app.handle_auto_chat_match_result(payload)
+        self.assertEqual(app.direct_mappings, {"a 시험고1 김민수": "101"})
+        self.assertIn(("lookup", ("101",)), bridge.calls)
+
+    def test_partial_same_name_room_does_not_erase_saved_owner_and_retry_recovers(self):
+        name = "A 시험고1 김민수"
+        mappings = {name: "101", "A 다른고2 김민수": "202"}
+        labels = {"101": "민수", "202": "김민수"}
+        other = direct_chat("202", "김민수")
+        result = matching.reconcile_chat_mappings(mappings, labels, (name,), [other])
+        self.assertEqual(result.ambiguous, (name,))
+        self.assertEqual(result.mappings[normalize_chat_match_name(name)], "101")
+        self.assertEqual(result.mapping_labels["101"], "민수")
+        self.assertEqual(matching.unverified_alias_mapping_names(
+            (name,), result.mappings, result.mapping_labels, [other]), (name,))
+        fresh = direct_chat("101", "민수")
+        recovered = matching.reconcile_chat_mappings(
+            result.mappings, result.mapping_labels, (name,), [fresh, other])
+        self.assertEqual(recovered.matched, (name,))
+        self.assertEqual(matching.unverified_alias_mapping_names(
+            (name,), recovered.mappings, recovered.mapping_labels, [fresh, other]), ())
+
+    def test_retained_ambiguous_exact_label_still_blocks_generator_preflight(self):
+        name = "김민수"
+        other = direct_chat("202", name)
+        result = matching.reconcile_chat_mappings({name: "101"}, {"101": name}, (name,), [other])
+        self.assertEqual(result.mappings, {name: "101"})
+        self.assertEqual(matching.unverified_alias_mapping_names(
+            iter((name,)), result.mappings, result.mapping_labels, [other]), (name,))
+
+    def test_two_requested_aliases_for_one_person_retain_owners_but_block_send(self):
+        names = ("A 시험고1 김민수", "A 다른고2 김민수")
+        rows = [direct_chat("101", "김민수"), direct_chat("202", "김민수")]
+        mappings = {names[0]: "101", names[1]: "202"}
+        labels = {"101": "김민수", "202": "김민수"}
+        result = matching.reconcile_chat_mappings(mappings, labels, names, rows)
+        self.assertEqual(len(result.mappings), 2)
+        self.assertEqual(result.matched, ())
+        self.assertEqual(matching.unverified_alias_mapping_names(
+            names, result.mappings, result.mapping_labels, rows), names)
 
     def test_incomplete_or_unsafe_fast_snapshot_falls_back_to_full_current_catalog(self):
         fresh = direct_chat("101", "김민수")
@@ -208,13 +276,67 @@ class AutoMatchingLatencyTests(unittest.TestCase):
         self.assertEqual(len(payload[3]), 259)
         self.assertIsNone(payload[4])
 
-    def test_before_send_still_uses_full_fresh_catalog(self):
+    def test_before_send_revalidates_saved_ids_without_full_catalog(self):
         fresh = direct_chat("101", "김민수")
         bridge = ReadBridge([fresh], [fresh])
         app = self.make_app(bridge)
         payload = self.query(app, reason="before_send")
-        self.assertEqual([call for call in bridge.calls if call[0] in {"list", "lookup"}], [("list",)])
+        self.assertEqual([call for call in bridge.calls if call[0] in {"list", "lookup"}], [("lookup", ("101",))])
         self.assertEqual(payload[3], [fresh])
+
+    def test_full_refresh_repairs_seven_sparse_rooms_in_51_saved_targets(self):
+        names = tuple(f"저장 대상 {index}" for index in range(1, 52))
+        mappings = {normalize_chat_match_name(name): str(i) for i, name in enumerate(names, 1)}
+        labels = {str(i): name for i, name in enumerate(names, 1)}
+        fresh = [direct_chat(cid, label) for cid, label in labels.items()]
+        sparse = [dict(row, peer_user_id="", peer_names=[]) if i < 7 else row
+                  for i, row in enumerate(fresh)]
+        bridge = ReadBridge(fresh, sparse)
+        app = self.make_app(bridge, mappings, labels)
+        payload = self.query(app, names, reason="mode_change")
+        self.assertIsNone(payload[4])
+        self.assertEqual(payload[3], fresh)
+        self.assertEqual([c for c in bridge.calls if c[0] == "lookup"],
+                         [("lookup", tuple(str(i) for i in range(1, 8)))])
+
+    def test_fallback_keeps_successful_ids_and_repairs_only_missing_room(self):
+        first, second = direct_chat("101", "김민수"), direct_chat("202", "이서연")
+
+        class PartialFirstBridge(ReadBridge):
+            def get_chats_by_ids(self, ids):
+                result = super().get_chats_by_ids(ids)
+                return [first] if len(ids) == 2 else result
+
+        bridge = PartialFirstBridge([first, second], [dict(second, peer_names=[], peer_user_id="")])
+        app = self.make_app(bridge, {"김민수": "101", "이서연": "202"}, {"101": "김민수", "202": "이서연"})
+        payload = self.query(app, ("김민수", "이서연"))
+        self.assertIsNone(payload[4])
+        self.assertEqual({r["chat_id"] for r in payload[3]}, {"101", "202"})
+        self.assertTrue(all(matching.confirmed_peer_name(r) for r in payload[3]))
+        self.assertEqual([c for c in bridge.calls if c[0] == "lookup"],
+                         [("lookup", ("101", "202")), ("lookup", ("202",))])
+
+    def test_incomplete_repair_does_not_remove_saved_ownership_or_pass_preflight(self):
+        sparse = dict(direct_chat("101", "김민수"), peer_names=[], peer_user_id="")
+        bridge = ReadBridge([], [sparse])
+        app = self.make_app(bridge)
+        app.guarded_mapping_ids = ("101",)
+        payload = self.query(app, reason="before_send")
+        app.handle_auto_chat_match_result(payload)
+        self.assertEqual(app.direct_mappings, {"김민수": "101"})
+        self.assertEqual(matching.unverified_alias_mapping_names(
+            ("김민수",), app.direct_mappings, app.direct_mapping_labels, payload[3],
+            guarded_mapping_ids=("101",)), ("김민수",))
+
+    def test_room_repair_preserves_duplicates_and_conflicting_metadata(self):
+        fresh = direct_chat("101", "김민수")
+        sparse = dict(fresh, peer_names=[], peer_user_id="")
+        conflicts = [dict(sparse, title="다른 이름"), dict(sparse, peer_user_id="99999"),
+                     dict(sparse, type="MultiChat", active_members=3)]
+        for row in conflicts:
+            self.assertEqual(matching.merge_verified_room_reads([row], [fresh]), [row])
+        self.assertEqual(matching.merge_verified_room_reads([sparse, sparse], [fresh]), [sparse, sparse])
+        self.assertEqual(matching.merge_verified_room_reads([sparse], [fresh, fresh]), [sparse])
 
     def test_metrics_report_real_stages_without_name_or_message_payloads(self):
         fresh = direct_chat("101", "김민수")

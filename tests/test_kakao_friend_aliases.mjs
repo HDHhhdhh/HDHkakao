@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   enrichDirectChatFriendAliases,
   fetchFriendAliasRecords,
+  enrichDirectChatFriendAliasesFromPeers,
   sanitizeFriendAliasRecord,
   sanitizeFriendAliasResponse,
 } from "../bridge/kakao_friend_aliases.mjs";
@@ -118,4 +119,60 @@ test("partial chat lists never receive friend aliases", () => {
     { complete: false },
   );
   assert.deepEqual(enriched[0].peer_local_names, []);
+});
+
+test("individual peer lookup is GET-only and strips unrelated data", async () => {
+  const chats = [{ chat_id: "700", type: "DirectChat", active_members: 2,
+    peer_user_id: "20", peer_names: ["별명"] }];
+  const calls = [];
+  const result = await enrichDirectChatFriendAliasesFromPeers(chats,
+    { oauth_token: "fixture", device_uuid: "fixture-device" }, {
+      fetchImpl: async (url, options) => {
+        calls.push([String(url), options.method]);
+        return { ok: true, async json() { return { status: 0, friend: {
+          userId: "20", friendNickName: "A 학교1 학생가", nickName: "별명", phoneNumber: "PRIVATE",
+        } }; } };
+      },
+    });
+  assert.deepEqual(calls, [["https://katalk.kakao.com/android/friends/20.json", "GET"]]);
+  assert.deepEqual(result[0].peer_local_names, ["A 학교1 학생가"]);
+  assert.equal(JSON.stringify(result).includes("PRIVATE"), false);
+});
+
+test("individual aliases reject wrong peer, wrong room, purged and failed responses", async () => {
+  const chats = [{ chat_id: "700", type: "DirectChat", active_members: 2,
+    peer_user_id: "20", peer_names: ["별명"] }];
+  for (const body of [
+    { status: 0, friend: { userId: "21", friendNickName: "오류" } },
+    { status: 0, friend: { userId: "20", friendNickName: "오류", directChatId: "701" } },
+    { status: 0, friend: { userId: "20", friendNickName: "오류", purged: true } },
+    { status: -1, friend: { userId: "20", friendNickName: "오류" } },
+  ]) {
+    const result = await enrichDirectChatFriendAliasesFromPeers(chats,
+      { oauth_token: "fixture", device_uuid: "fixture-device" }, {
+        fetchImpl: async () => ({ ok: true, async json() { return body; } }),
+      });
+    assert.deepEqual(result[0].peer_local_names, []);
+  }
+});
+
+test("individual lookup skips groups and unverified peers, bounds parallelism and isolates failures", async () => {
+  let active = 0, peak = 0, requests = 0;
+  const chats = Array.from({ length: 9 }, (_, i) => ({ chat_id: String(700 + i), type: "DirectChat",
+    active_members: 2, peer_user_id: String(20 + i), peer_names: ["별명"] }));
+  const result = await enrichDirectChatFriendAliasesFromPeers([
+    ...chats, { ...chats[0], type: "MultiChat" }, { ...chats[0], peer_user_id: "99", peer_names: [] },
+  ], { oauth_token: "fixture", device_uuid: "fixture-device" }, {
+    fetchImpl: async url => {
+      requests++; active++; peak = Math.max(peak, active);
+      await new Promise(resolve => setImmediate(resolve)); active--;
+      const id = String(url).match(/\/(\d+)\.json$/)[1];
+      if (id === "20") throw new Error("PRIVATE CREDENTIAL");
+      return { ok: true, async json() { return { status: 0, friend: { userId: id, friendNickName: "저장 이름" } }; } };
+    },
+  });
+  assert.equal(requests, 9); assert.equal(peak, 4);
+  assert.deepEqual(result[0].peer_local_names, []);
+  assert.deepEqual(result[1].peer_local_names, ["저장 이름"]);
+  assert.deepEqual(result.at(-1).peer_local_names, []);
 });

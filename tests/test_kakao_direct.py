@@ -471,6 +471,22 @@ class DirectBridgeTests(unittest.TestCase):
         self.assertNotIn("PRIVATE", repr(chats))
         self.assertNotIn("SECRET", repr(chats))
 
+    def test_resolve_chat_aliases_requests_only_metadata_with_explicit_alias_flag(self) -> None:
+        bridge, _ = self._bridge(enabled=False)
+        bridge._request = Mock(return_value={"chats": [{
+            "chat_id": "101", "type": "DirectChat", "active_members": 2,
+            "peer_user_id": "20", "peer_names": ["별명"],
+            "peer_local_names": ["A 학교1 학생가"],
+        }]})
+        try:
+            chats = bridge.resolve_chat_aliases(["101"])
+        finally:
+            bridge.close()
+        calls = [call for call in bridge._request.call_args_list if call.args == ("get_chats_by_ids",)]
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].kwargs["resolve_friend_aliases"])
+        self.assertEqual(chats[0]["peer_local_names"], ["A 학교1 학생가"])
+
     def test_get_chats_by_ids_empty_input_never_starts_a_request(self) -> None:
         bridge, _ = self._bridge(enabled=False)
         bridge._request = Mock(  # type: ignore[method-assign]

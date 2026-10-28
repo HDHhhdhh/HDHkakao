@@ -175,3 +175,45 @@ export function enrichDirectChatFriendAliases(chats, aliases, { complete = true 
 }
 
 export { DEFAULT_TIMEOUT_MS as DEFAULT_FRIEND_ALIAS_TIMEOUT_MS };
+
+/** Resolve peers individually when a companion's aggregate friend list is empty. */
+export async function enrichDirectChatFriendAliasesFromPeers(
+  chats, credentials, { fetchImpl = globalThis.fetch, timeoutMs = 6000, config = {} } = {},
+) {
+  if (!Array.isArray(chats) || chats.length > 128) throw new KakaoFriendAliasError("friend_lookup_limit");
+  const oauthToken = String(credentials?.oauth_token ?? credentials?.oauthToken ?? "");
+  const deviceUuid = String(credentials?.device_uuid ?? credentials?.deviceUuid ?? "");
+  if (!oauthToken || !deviceUuid) throw new KakaoFriendAliasError("friend_list_credentials_missing");
+  const request = requestConfig(credentials, config);
+  const peerIds = [...new Set(chats.filter(chat =>
+    String(chat?.type ?? "").toLowerCase() === "directchat" && chat.active_members === 2
+    && normalizedId(chat.chat_id) && Array.isArray(chat.peer_names) && chat.peer_names.length === 1
+    && safeName(chat.peer_names[0]),
+  ).map(chat => normalizedId(chat.peer_user_id)).filter(Boolean))];
+  const aliases = [];
+  const deadline = AbortSignal.timeout(15_000);
+  let next = 0;
+  const worker = async () => {
+    while (next < peerIds.length && !deadline.aborted) {
+      const peerId = peerIds[next++];
+      try {
+        const response = await fetchImpl(`https://katalk.kakao.com/${request.apiPrefix}/friends/${peerId}.json`, {
+          method: "GET", signal: AbortSignal.any([
+            deadline, AbortSignal.timeout(Math.max(1, Number(timeoutMs) || 6000)),
+          ]),
+          headers: { Authorization: `${oauthToken}-${deviceUuid}`, A: request.agent,
+            "User-Agent": request.userAgent, Accept: "*/*", "Accept-Language": request.language },
+        });
+        if (!response?.ok) continue;
+        const body = await response.json();
+        const alias = body?.status === 0 && body.friend?.purged !== true
+          ? sanitizeFriendAliasRecord(body.friend) : null;
+        if (alias?.user_id === peerId && alias.friend_name) aliases.push(alias);
+      } catch {
+        // Optional metadata failure must never become a guessed name or expose auth.
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, peerIds.length) }, worker));
+  return enrichDirectChatFriendAliases(chats, aliases);
+}

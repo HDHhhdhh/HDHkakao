@@ -15,9 +15,12 @@ from kakao_mapping_policy import ManualChatCandidate, normalize_chat_match_name,
 from kakao_chat_catalog import MAX_PC_CHAT_CATALOG_IDS, discover_pc_chat_catalog_ids
 from kakao_pc_lease import pc_kakao_ui_lease
 from kakao_diagnostics import connection_guidance
+from kakao_matching_diagnostics import record_matching_diagnostic
 from kakao_direct import DirectBridgeError, DirectKakaoConfig, KakaoDirectBridge, MAX_CHAT_LOOKUP_IDS, normalize_guarded_mapping_ids, normalize_mapping_labels, normalize_mappings, redact_error
 from kakao_sender import MessageRow, deep_merge, close_chat_after_send, focus_kakao_window_via_uia, find_kakao_windows, get_window_rect, chat_title_matches, open_chat, require_pyautogui, return_to_recent_chat_top, normalize_runtime_config, schedule_datetime_for_row
 from recover_chat_mappings import merge_sanitized_chat_list
+from kakao_mapping_policy import merge_verified_chat_aliases
+from kakao_mapping_policy import structured_direct_chat_aliases
 try:
     from kakao_pc_chat_map import discover_pc_chat_map
 except ImportError:
@@ -115,6 +118,75 @@ def saved_target_lookup_is_complete(
     )
 
 
+def saved_target_candidate_ids(chat_names, mappings, labels):
+    """Nominate saved IDs, including canonical aliases; never confirm a match.
+
+    A new/renamed CSV row must not disable fresh ID reads for all other rows.
+    Canonical-name candidates still pass the ordinary identity/ownership gates.
+    """
+    safe_mappings = normalize_mappings(mappings)
+    safe_labels = normalize_mapping_labels(labels)
+    ids = []
+    for name in chat_names:
+        exact = resolve_chat_mapping(safe_mappings, name)
+        candidates = [exact] if exact else [
+            chat_id for owner, chat_id in safe_mappings.items()
+            if normalize_chat_match_name(owner) in {
+                normalize_chat_match_name(name), *structured_direct_chat_aliases(name)
+            }
+        ]
+        for chat_id in candidates:
+            if (positive_numeric_chat_id(chat_id)
+                    and is_confirmed_mapping_label(chat_id, safe_labels.get(chat_id))):
+                ids.append(chat_id)
+    return tuple(dict.fromkeys(ids))
+
+
+def merge_verified_room_reads(primary, supplemental):
+    """Fill incomplete rows from this request only; never hide contradictions."""
+    rows = merge_chat_snapshots(primary, supplemental)
+    base_by_id: dict[str, list[int]] = {}
+    extra_by_id: dict[str, list[Mapping[str, Any]]] = {}
+    for index, row in enumerate(rows):
+        base_by_id.setdefault(str(row.get("chat_id", "")), []).append(index)
+    for row in supplemental:
+        if isinstance(row, Mapping):
+            extra_by_id.setdefault(str(row.get("chat_id", "")), []).append(row)
+    for chat_id, indexes in base_by_id.items():
+        extra = extra_by_id.get(chat_id, ())
+        if len(indexes) != 1 or len(extra) != 1:
+            continue
+        old, fresh = rows[indexes[0]], extra[0]
+        if (not is_one_to_one_direct_chat(old) or confirmed_peer_name(old)
+                or not is_one_to_one_direct_chat(fresh) or not confirmed_peer_name(fresh)):
+            continue
+        # A sparse name/identity is repairable. A different known name or peer
+        # is a conflict, even if the supplemental row looks complete.
+        old_label = normalize_chat_match_name(confirmed_chat_label(old))
+        fresh_label = normalize_chat_match_name(confirmed_chat_label(dict(fresh)))
+        old_peer = str(old.get("peer_user_id") or "").strip()
+        if ((old_label and old_label != fresh_label)
+                or (old_peer and old_peer != str(fresh.get("peer_user_id") or "").strip())
+                or (old.get("peer_names") and old.get("peer_names") != fresh.get("peer_names"))):
+            continue
+        rows[indexes[0]] = dict(fresh)
+    return rows
+
+
+def verified_saved_room_reads(chats, saved_ids, labels):
+    """Select unique current rows whose saved label and identity are complete."""
+    counts: dict[str, int] = {}
+    for row in chats:
+        chat_id = str(row.get("chat_id") or "")
+        counts[chat_id] = counts.get(chat_id, 0) + 1
+    expected = set(saved_ids)
+    return [row for row in chats
+            if row.get("chat_id") in expected and counts[row["chat_id"]] == 1
+            and is_one_to_one_direct_chat(row) and confirmed_peer_name(row)
+            and normalize_chat_match_name(confirmed_chat_label(row))
+            == normalize_chat_match_name(labels.get(row["chat_id"]))]
+
+
 @dataclass(frozen=True, slots=True)
 class PcChatFallbackResult:
     """Safe result of resolving only the remaining names through PC geometry."""
@@ -123,6 +195,7 @@ class PcChatFallbackResult:
     unresolved: tuple[str, ...]
     mapping_labels: dict[str, str] = field(default_factory=dict)
     retry_safe: bool = True
+    verified_chats: tuple[dict[str, Any], ...] = ()
 
 
 def unique_chat_names(rows: list[MessageRow] | tuple[MessageRow, ...]) -> tuple[str, ...]:
@@ -276,6 +349,7 @@ def resolve_pc_chat_ids_via_window(
     prepare_friend_tab: bool = False,
     friend_tab_focus: Callable[[list[str]], str | None] | None = None,
     screen_use_callback: Callable[[bool, threading.Event, threading.Event | None], None] | None = None,
+    chat_lookup: Callable[[tuple[str, ...]], Iterable[Mapping[str, Any]]] | None = None,
 ) -> PcChatFallbackResult:
     """Resolve unresolved names by reading existing PC chat-window geometry.
 
@@ -403,6 +477,7 @@ def resolve_pc_chat_ids_via_window(
         )
         resolved: dict[str, str] = {}
         resolved_labels: dict[str, str] = {}
+        verified_chats: list[dict[str, Any]] = []
         used_ids: dict[str, str] = {
             str(chat_id).strip(): "existing"
             for chat_id in reserved_chat_ids
@@ -432,6 +507,7 @@ def resolve_pc_chat_ids_via_window(
                     break
                 context: Any = None
                 resolved_id: str | None = None
+                verified_chat: dict[str, Any] | None = None
                 cleanup_ok = True
                 try:
                     if prepare_friend_tab:
@@ -466,6 +542,24 @@ def resolve_pc_chat_ids_via_window(
                             height = bottom - top
                             resolution = provider.resolve_window_rect(left, top, width, height)
                             candidate = str(getattr(resolution, "chat_id", "") or "").strip()
+                            # Opening a room may add an ID after the initial catalog
+                            # read. Nominate its exact local rectangle, then require
+                            # fresh server membership instead of the old ID list.
+                            candidate_reader = getattr(provider, "resolve_window_rect_candidate", None)
+                            if (chat_lookup is not None and callable(candidate_reader)
+                                    and (not is_exact_pc_geometry_resolution(resolution) or candidate not in tablet_by_id)
+                                    and not operation_cancel_event.is_set()):
+                                nominated = candidate_reader(left, top, width, height)
+                                nominated_id = positive_numeric_chat_id(getattr(nominated, "chat_id", None))
+                                if is_exact_pc_geometry_resolution(nominated) and nominated_id and nominated_id not in used_ids:
+                                    fresh = tuple(chat_lookup((nominated_id,)))
+                                    if (len(fresh) == 1 and isinstance(fresh[0], Mapping)
+                                            and str(fresh[0].get("chat_id")) == nominated_id
+                                            and is_one_to_one_direct_chat(fresh[0]) and confirmed_peer_name(fresh[0])
+                                            and not operation_cancel_event.is_set()):
+                                        verified_chat = dict(fresh[0])
+                                        tablet_by_id[nominated_id] = verified_chat
+                                        resolution, candidate = nominated, nominated_id
                             pc_label = str(getattr(context, "chat_title", "") or "").strip()
                             tablet_chat = tablet_by_id.get(candidate)
                             is_verified_direct = bool(
@@ -529,6 +623,8 @@ def resolve_pc_chat_ids_via_window(
                     # DirectChat persistence uses the tablet's current label after
                     # re-checking the chat metadata there.
                     resolved_labels[resolved_id] = str(getattr(context, "chat_title", "") or "").strip()
+                    if verified_chat is not None:
+                        verified_chats.append(verified_chat)
                 else:
                     unresolved.append(name)
                 if not cleanup_ok:
@@ -542,6 +638,7 @@ def resolve_pc_chat_ids_via_window(
                 tuple(dict.fromkeys(unresolved)),
                 resolved_labels,
                 retry_safe=retry_safe,
+                verified_chats=tuple(verified_chats),
             )
             return result
         finally:
@@ -681,7 +778,7 @@ class HubChatMatchingMixin:
     ) -> bool:
         """Refresh chat IDs in a worker and reconcile them on the Tk thread.
 
-        File loading checks only saved IDs when every target already has a
+        File loading and preflight check only saved IDs when every target has a
         confirmed owner. New targets or incomplete room evidence require a
         fresh full list. Other requests always use read-only ``list_chats``
         plus bounded server lookups for omitted IDs. Manual
@@ -734,9 +831,11 @@ class HubChatMatchingMixin:
         names_snapshot = tuple(normalized_names)
         mappings_snapshot = dict(self.__dict__.get("direct_mappings", {}))
         labels_snapshot = dict(self.__dict__.get("direct_mapping_labels", {}))
+        guarded_snapshot = tuple(self.__dict__.get("guarded_mapping_ids", getattr(self.direct_config, "guarded_mapping_ids", ())))
+        current_csv_names = {normalize_chat_match_name(name) for name in unique_chat_names(self.__dict__.get("rows", ()))}
         saved_ids = (
-            saved_target_lookup_ids(names_snapshot, mappings_snapshot, labels_snapshot)
-            if reason == "file_load"
+            saved_target_candidate_ids(names_snapshot, mappings_snapshot, labels_snapshot)
+            if reason in {"file_load", "before_send"}
             else ()
         )
         started_at = time.perf_counter()
@@ -783,6 +882,7 @@ class HubChatMatchingMixin:
             mode = "saved_ids" if saved_ids else "full_list"
             durations = {phase: 0.0 for phase in ("connect", "list", "lookup", "close")}
             queried_ids: set[str] = set()
+            target_chats: list[dict[str, Any]] = []
 
             def check_cancelled() -> None:
                 if cancel_event.is_set():
@@ -805,7 +905,6 @@ class HubChatMatchingMixin:
                     measure("connect", ready)
                 check_cancelled()
                 if saved_ids:
-                    target_chats: list[dict[str, Any]] = []
                     for offset in range(0, len(saved_ids), MAX_CHAT_LOOKUP_IDS):
                         check_cancelled()
                         batch = saved_ids[offset : offset + MAX_CHAT_LOOKUP_IDS]
@@ -830,6 +929,12 @@ class HubChatMatchingMixin:
                         chats = []
                         supplemental_warning = "full_list_failed"
                         supplemental_failure = safe_auto_match_failure(exc)
+                # Keep independently verified IDs from the first lookup when
+                # the aggregate fallback omits them or returns sparse metadata.
+                # This is current-request evidence, never a persisted cache.
+                if target_chats and chats is not target_chats:
+                    usable = verified_saved_room_reads(target_chats, saved_ids, labels_snapshot)
+                    chats = merge_verified_room_reads(chats, usable)
                 check_cancelled()
                 base_chat_ids = {
                     chat_id
@@ -837,6 +942,7 @@ class HubChatMatchingMixin:
                         positive_numeric_chat_id(chat.get("chat_id"))
                         for chat in chats
                         if isinstance(chat, Mapping)
+                        and (not is_one_to_one_direct_chat(chat) or bool(confirmed_peer_name(chat)))
                     )
                     if chat_id
                 }
@@ -925,7 +1031,35 @@ class HubChatMatchingMixin:
                     }
                     if required_supplemental_ids.difference(verified_supplemental_ids):
                         supplemental_warning = supplemental_warning or "lookup_incomplete"
-                    chats = merge_chat_snapshots(chats, supplemental)
+                    chats = merge_verified_room_reads(chats, supplemental)
+                # A public nickname can differ entirely from the PC saved name.
+                # Resolve exact account-local aliases only for unresolved requests;
+                # saved-name fast lookups never pay for this HTTP metadata pass.
+                initial_match = reconcile_chat_mappings(
+                    mappings_snapshot, labels_snapshot, names_snapshot, chats,
+                    guarded_mapping_ids=guarded_snapshot,
+                )
+                alias_lookup = getattr(bridge, "resolve_chat_aliases", None)
+                if (initial_match.unmatched or initial_match.ambiguous) and callable(alias_lookup):
+                    alias_ids = tuple(dict.fromkeys(
+                        positive_numeric_chat_id(chat.get("chat_id")) for chat in chats
+                        if is_one_to_one_direct_chat(chat) and confirmed_peer_name(chat)
+                        and positive_numeric_chat_id(chat.get("chat_id"))
+                    ))[:MAX_PC_CHAT_CATALOG_IDS]
+                    for offset in range(0, len(alias_ids), MAX_CHAT_LOOKUP_IDS):
+                        check_cancelled()
+                        batch = alias_ids[offset:offset + MAX_CHAT_LOOKUP_IDS]
+                        try:
+                            aliases = measure("lookup", lambda: alias_lookup(batch))
+                            requested = set(batch)
+                            aliases = [chat for chat in aliases if isinstance(chat, Mapping)
+                                       and positive_numeric_chat_id(chat.get("chat_id")) in requested
+                                       and is_one_to_one_direct_chat(chat) and confirmed_peer_name(chat)]
+                            chats = merge_verified_chat_aliases(chats, aliases)
+                        except Exception:
+                            # Keep the verified base list; no inferred names enter it.
+                            supplemental_warning = supplemental_warning or "lookup_failed"
+                    check_cancelled()
                 if pc_config_snapshot is not None and chats:
                     # Determine unresolved names from the same immutable
                     # snapshots used for this request; Tk state is never read
@@ -935,7 +1069,14 @@ class HubChatMatchingMixin:
                         labels_snapshot,
                         names_snapshot,
                         chats,
+                        guarded_mapping_ids=guarded_snapshot,
                     )
+                    rows_by_id = {str(chat.get("chat_id")): chat for chat in chats}
+                    protected_names = current_csv_names | {normalize_chat_match_name(name) for name in names_snapshot}
+                    reserved_pc_ids = tuple(chat_id for owner, chat_id in reconciled.mappings.items()
+                        if chat_id in guarded_snapshot or normalize_chat_match_name(owner) in protected_names
+                        or normalize_chat_match_name(owner) != normalize_chat_match_name(
+                            confirmed_chat_label(rows_by_id.get(chat_id, {}))))
                     # Ambiguous names are deliberately never sent through the
                     # PC geometry fallback: opening the first same-title
                     # result could silently choose the wrong recipient.  Only
@@ -950,12 +1091,14 @@ class HubChatMatchingMixin:
                             unresolved_names,
                             chats,
                             pc_config_snapshot,
-                            reserved_chat_ids=reconciled.mappings.values(),
+                            reserved_chat_ids=reserved_pc_ids,
                             cancel_event=cancel_event,
                             screen_use_callback=screen_callback,
+                            chat_lookup=getattr(bridge, "get_chats_by_ids", None),
                         )
                         pc_mappings = dict(fallback.mappings)
                         pc_mapping_labels = dict(fallback.mapping_labels)
+                        chats = merge_chat_snapshots(chats, getattr(fallback, "verified_chats", ()))
                         friend_tab_names = tuple(getattr(fallback, "unresolved", ()) or ())
                         if fallback.retry_safe and friend_tab_names and not cancel_event.is_set():
                             # PC aliases for ordinary 1:1 contacts can be absent
@@ -972,15 +1115,17 @@ class HubChatMatchingMixin:
                                 chats,
                                 pc_config_snapshot,
                                 reserved_chat_ids=(
-                                    *reconciled.mappings.values(),
+                                    *reserved_pc_ids,
                                     *pc_mappings.values(),
                                 ),
                                 cancel_event=cancel_event,
                                 prepare_friend_tab=True,
                                 screen_use_callback=friend_screen_callback,
+                                chat_lookup=getattr(bridge, "get_chats_by_ids", None),
                             )
                             pc_mappings.update(friend_fallback.mappings)
                             pc_mapping_labels.update(friend_fallback.mapping_labels)
+                            chats = merge_chat_snapshots(chats, getattr(friend_fallback, "verified_chats", ()))
             except Exception as exc:
                 # Never put raw exception text in the queue.  Third-party
                 # adapters may include tokens, while stable error codes and a
@@ -1047,6 +1192,7 @@ class HubChatMatchingMixin:
                 previous_labels,
                 chat_names,
                 chats,
+                guarded_mapping_ids=previous_guarded_ids,
             )
             self.direct_mappings = dict(reconciled.mappings)
             self.direct_mapping_labels = dict(reconciled.mapping_labels)
@@ -1089,6 +1235,10 @@ class HubChatMatchingMixin:
                 for name in reconciled.unmatched
                 if normalize_chat_match_name(name)
             }
+            protected_pc_owners = {
+                normalize_chat_match_name(value)
+                for value in (*chat_names, *unique_chat_names(self.__dict__.get("rows", ())))
+            }
             for raw_name, raw_chat_id in pc_mapping_items:
                 name = str(raw_name).strip()
                 normalized_name = normalize_chat_match_name(name)
@@ -1110,13 +1260,15 @@ class HubChatMatchingMixin:
                 )
                 accepted_label = tablet_label if verified_direct else verified_pc_title
                 canonical_catalog_owner: str | None = None
-                if verified_direct and tablet_label and chat_id in used_chat_ids:
+                if (verified_direct and tablet_label and chat_id in used_chat_ids
+                        and chat_id not in previous_guarded_ids):
                     canonical_label = normalize_chat_match_name(tablet_label)
                     canonical_owners = [
                         existing_name
                         for existing_name, existing_chat_id in self.direct_mappings.items()
                         if str(existing_chat_id).strip() == chat_id
                         and normalize_chat_match_name(existing_name) == canonical_label
+                        and normalize_chat_match_name(existing_name) not in protected_pc_owners
                     ]
                     # A catalog label may be replaced only when it is the
                     # sole owner of this stable ID.  A differing/manual
@@ -1340,6 +1492,11 @@ class HubChatMatchingMixin:
                 "자동 매칭",
                 f"{reason} 채팅방 조회 실패 · {failure.cause} · code={failure.code} · 다음 행동: {failure.next_action}",
             )
+            record_matching_diagnostic(
+                reason, chat_names, self.__dict__.get("direct_mappings", {}),
+                self.__dict__.get("direct_mapping_labels", {}), [],
+                guarded_ids=self.__dict__.get("guarded_mapping_ids", ()), error_code=failure.code,
+            )
             if callback is not None:
                 callback(False)
             return
@@ -1352,6 +1509,16 @@ class HubChatMatchingMixin:
             pc_mapping_labels=pc_mapping_labels,
         )
         log_metrics(time.perf_counter() - apply_started)
+        record_matching_diagnostic(
+            reason, chat_names, self.__dict__.get("direct_mappings", {}),
+            self.__dict__.get("direct_mapping_labels", {}), chats,
+            guarded_ids=self.__dict__.get("guarded_mapping_ids", ()),
+            error_code=(
+                "mapping_save_failed" if not success else
+                supplemental_failure.code if supplemental_failure is not None else
+                supplemental_warning
+            ),
+        )
         if success:
             # Manual selection must use the same sanitized, generation-matched
             # snapshot that was just reconciled on the Tk thread.  Copy each

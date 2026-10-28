@@ -2782,6 +2782,19 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
             snapshot,
             target_names=direct_names,
         )
+        current_ids = {str(chat.get("chat_id") or "").strip() for chat in snapshot}
+        pending_saved = [name for name in direct_names
+                         if (chat_id := resolve_chat_mapping(self.direct_mappings, name))
+                         and chat_id not in current_ids
+                         and is_confirmed_mapping_label(chat_id, self.direct_mapping_labels.get(chat_id))]
+        if pending_saved:
+            self.set_auto_match_send_wait(False)
+            self.run_row_indexes = None
+            self.status_var.set(
+                f"저장 ID 유지 · {len(pending_saved)}명 서버 조회 미완료 · 발송 버튼으로 다시 확인하세요."
+            )
+            self.log("서버 조회 미완료", "재매칭하지 않고 저장 ID를 유지합니다: " + ", ".join(pending_saved))
+            return
         if unresolved:
             self.status_var.set(f"자동 매칭 후 미해결 {len(unresolved)}명 · 수동 매칭에서 확인하세요.")
             self.log("수동 매칭", "발송 전 미해결 대상: " + ", ".join(unresolved[:12]))
