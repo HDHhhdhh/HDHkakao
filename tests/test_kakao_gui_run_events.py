@@ -391,7 +391,7 @@ class SendRunGuiEventTests(unittest.TestCase):
             app.reload_file()
 
         load_messages.assert_not_called()
-        showinfo.assert_called_once()
+        showinfo.assert_not_called()
         self.assertIs(app.rows, original_rows)
         self.assertIs(app.active_run, supervisor)
 
@@ -412,7 +412,7 @@ class SendRunGuiEventTests(unittest.TestCase):
         self.assertIsNone(app.cell_editor)
         self.assertIsNone(app.cell_editor_info)
         self.assertIs(app.rows[0], original_row)
-        showinfo.assert_called_once()
+        showinfo.assert_not_called()
 
     def test_big_edit_dialog_cannot_open_while_run_is_active(self) -> None:
         app = KakaoSenderApp.__new__(KakaoSenderApp)
@@ -424,7 +424,7 @@ class SendRunGuiEventTests(unittest.TestCase):
         ):
             app.edit_selected_row()
 
-        showinfo.assert_called_once()
+        showinfo.assert_not_called()
         toplevel.assert_not_called()
 
     def test_close_timeout_exposes_wait_force_and_cancel_choices(self) -> None:

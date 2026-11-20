@@ -70,6 +70,7 @@ class HubLoadingMixin:
             or (worker is not None and worker.is_alive())
             or state.get("_auto_match_waiting_to_send")
             or state.get("_active_send_preparation_token") is not None
+            or state.get("_send_confirmation_active")
         )
 
     def _set_document_read_state(self, loading: bool) -> None:
@@ -81,9 +82,6 @@ class HubLoadingMixin:
         if self.__dict__.get("_close_requested"):
             return False
         if self._document_read_blocked():
-            messagebox.showinfo(
-                "실행 중", "발송 준비와 결과 처리가 끝난 뒤 파일을 변경해 주세요.",
-            )
             return False
         path = candidate_path if candidate_path is not None else self.__dict__.get("file_path")
         if path is None:

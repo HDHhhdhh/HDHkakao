@@ -297,10 +297,7 @@ class GuiFeedbackTests(unittest.TestCase):
 
         # Then
         self.assertEqual(started, [])
-        showinfo.assert_called_once_with(
-            "2차 전송 대상 없음",
-            "PC 화면으로 다시 보낼 명시적인 직접 전송 실패 행이 없습니다.",
-        )
+        showinfo.assert_not_called()
 
     def test_retry_button_shows_failure_count_and_enabled_state(self):
         # Given

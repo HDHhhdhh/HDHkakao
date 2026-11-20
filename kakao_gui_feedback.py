@@ -169,7 +169,7 @@ class HubRunFeedbackMixin:
         return (
             state.get("active_run") is not None
             or any(state.get(name) for name in (
-                "_auto_match_loading", "_diagnostic_busy", "_document_loading", "_capacity_loading",
+                "_auto_match_loading", "_diagnostic_busy", "_document_loading", "_capacity_loading", "_journal_loading",
             ))
             or bool(state.get("_exports_pending"))
             or bool(state.get("_recovery_offer_token"))
@@ -233,6 +233,8 @@ class HubRunFeedbackMixin:
             self.handle_diagnostic_result(payload)
         elif event == "attachment_dimensions":
             self.handle_attachment_dimensions(payload)
+        elif event == "run_journal_ready":
+            self.handle_run_journal_ready(payload)
         elif event == "recovery_offer_result":
             self.handle_recovery_offer_result(payload)
         elif event == "run_history_result":
@@ -466,6 +468,11 @@ class HubRunFeedbackMixin:
 
 
     def restore_send_controls(self) -> None:
+        if "action_hint_var" in self.__dict__:
+            self.set_attachment_edit_state(False)
+            self.__dict__.pop("_primary_action_appearance", None)
+            self.refresh_primary_action_visual()
+            return
         self.start_button.state(["!disabled"])
         self.test_one_check.state(["!disabled"])
         self.set_attachment_edit_state(False)

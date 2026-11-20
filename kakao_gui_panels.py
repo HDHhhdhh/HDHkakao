@@ -102,6 +102,8 @@ class HubRunPanelsMixin:
             return False
         index_map = {old: new for new, (old, _) in enumerate(selected)}
         self.cancel_auto_chat_matches()
+        self._pending_file_match = None
+        self._file_match_failed = False
         self.cancel_cell_edit()
         self.rows = [row for _, row in selected]
         self.file_path = Path(recovery.source_path) if recovery.source_path else None
@@ -134,6 +136,8 @@ class HubRunPanelsMixin:
 
 
     def open_run_history(self) -> None:
+        if self.__dict__.get("_journal_loading"):
+            return
         if self.__dict__.get("run_journal") is None:
             messagebox.showerror("실행 기록", self.__dict__.get("_journal_error") or "실행 기록 저장소를 열 수 없습니다.")
             return
@@ -323,8 +327,7 @@ class HubRunPanelsMixin:
 
 
     def open_connection_diagnostics(self) -> None:
-        if self.__dict__.get("active_run") is not None or self.__dict__.get("_auto_match_loading"):
-            messagebox.showinfo("작업 중", "발송 또는 매칭 작업을 마친 뒤 연결 상태를 점검해 주세요.")
+        if self.action_block("diagnostics"):
             return
         existing = self.__dict__.get("_diagnostic_dialog")
         if existing is not None and existing.winfo_exists():
@@ -356,10 +359,10 @@ class HubRunPanelsMixin:
             if not self._diagnostic_config_is_current():
                 self._invalidate_diagnostic_config()
                 return
-            if self.__dict__.get("active_run") is not None or self.__dict__.get("_auto_match_loading"):
-                messagebox.showinfo("작업 중", "발송 또는 매칭 작업을 마친 뒤 직접 연결을 확인해 주세요.")
+            if self.action_block("diagnostics"):
                 return
             self._diagnostic_busy = True
+            self.refresh_matching_controls()
             self._diagnostic_check_button.state(["disabled"])
             config = deepcopy(self.direct_config)
             bridge_factory, post = self.create_direct_bridge, self.post
@@ -372,7 +375,10 @@ class HubRunPanelsMixin:
                     failure = safe_auto_match_failure(exc)
                     message = f"{failure.cause} ({failure.code})\n" + "\n".join(connection_guidance(failure.code))
                 post("diagnostic_result", (token, message, True))
-            threading.Thread(target=worker, daemon=True).start()
+            try:
+                threading.Thread(target=worker, daemon=True).start()
+            except RuntimeError:
+                self.handle_diagnostic_result((token, "서버 점검을 시작하지 못했습니다. 다시 시도하세요.", True))
 
         self._diagnostic_check_button = ttk.Button(dialog, text="직접 연결 확인 · 목록 조회만", command=check_server, state="disabled")
         self._diagnostic_check_button.pack(side="bottom", before=text, pady=(0, 14))
@@ -387,7 +393,13 @@ class HubRunPanelsMixin:
             except Exception:
                 message = "로컬 준비 점검을 완료하지 못했습니다. 설치 경로와 실행환경을 확인하세요."
             post("diagnostic_result", (token, message, False))
-        threading.Thread(target=local_worker, daemon=True).start()
+        try:
+            threading.Thread(target=local_worker, daemon=True).start()
+        except RuntimeError:
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.insert("end", "로컬 점검을 시작하지 못했습니다. 창을 닫고 다시 시도하세요.")
+            text.configure(state="disabled")
 
     def _diagnostic_config_is_current(self) -> bool:
         return (self.__dict__.get("_diagnostic_config_snapshot") == self.direct_config
@@ -408,6 +420,7 @@ class HubRunPanelsMixin:
             return
         if server:
             self._diagnostic_busy = False
+            self.resume_deferred_file_match()
         dialog = self.__dict__.get("_diagnostic_dialog")
         if dialog is None or not dialog.winfo_exists():
             return

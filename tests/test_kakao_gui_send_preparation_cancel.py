@@ -26,6 +26,8 @@ class SendPreparationCancellationTests(unittest.TestCase):
         app.start_sending_after_preflight = Mock()
         app.set_attachment_edit_state = Mock()
         app._latest_chat_snapshot = ()
+        app.direct_mappings = {}
+        app.direct_mapping_labels = {}
         app._auto_match_generation = 0
         app._auto_match_loading = False
         app._auto_match_pending_callback = None

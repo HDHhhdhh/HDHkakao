@@ -9,6 +9,7 @@ import queue
 import re
 import threading
 import time
+import traceback
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -18,7 +19,7 @@ from types import SimpleNamespace
 from typing import Any, Final
 
 import tkinter as tk
-from tkinter import filedialog, font as tkfont, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from kakao_gui_theme import configure_hub_style
 from kakao_gui_text import KoreanLabel
@@ -126,6 +127,7 @@ from kakao_direct import (
     DirectSendUnknownError,
     KakaoDirectBridge,
     MAX_CHAT_LOOKUP_IDS,
+    atomic_write_json,
     normalize_chat_name,
     normalize_chat_id,
     normalize_guarded_mapping_ids,
@@ -451,11 +453,8 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         self._recovery_retry_records_by_number: dict[int, dict[str, Any]] = {}
         self._last_run_sources_by_number: dict[int, tuple[str, int]] = {}
         self._journal_error: str | None = None
-        try:
-            self.run_journal = RunJournal()
-        except RunJournalError as exc:
-            self.run_journal = None
-            self._journal_error = str(exc)
+        self._journal_loading = True
+        self.run_journal: RunJournal | None = None
         self.active_run: SendRunSupervisor | None = None
         # Compatibility view for code that only needs the current cancellation
         # signal. A fresh event is installed from ``active_run`` for each run.
@@ -538,6 +537,9 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         self.configure_style()
         self.build_layout()
         self.status_var.trace_add("write", self.refresh_primary_action_visual)
+        for variable in (self.start_at_var, self.limit_var, self.test_one_var,
+                         self.common_schedule_var, self.schedule_at_var):
+            variable.trace_add("write", self.refresh_primary_action_visual)
         self.refresh_primary_action_visual()
         self.file_drop_enabled, drop_hint = enable_file_drop(
             self, (self.attachment_panel, self.tree), self.on_attachment_drop,
@@ -557,7 +559,7 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         self.bind_all("<Shift-Escape>", self._on_screen_use_hotkey, add="+")
         self.after(100, self.drain_queue)
         self.after(1000, self.tick_elapsed)
-        self.after(500, self.offer_run_recovery)
+        self.after_idle(self.initialize_run_journal)
         self.after(300, self.tick_schedule_capacity)
 
     def apply_display_half_geometry(self) -> None:
@@ -570,6 +572,8 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         self.update_idletasks()
         self.geometry(f"{width}x{height}")
         self.release_size_constraints()
+        # Native maximization respects the Windows taskbar and restore button.
+        self.state("zoomed")
 
     def release_size_constraints(self) -> None:
         self.minsize(*self.__dict__.get('min_window_size', MIN_WINDOW_SIZE))
@@ -593,27 +597,162 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
             self.geometry(geometry)
         self.after(50, self.release_size_constraints)
 
+    def initialize_run_journal(self) -> None:
+        post = self.post
+
+        def open_journal() -> None:
+            try:
+                journal = RunJournal()
+            except RunJournalError:
+                post("run_journal_ready", (None, "실행 기록을 열지 못했습니다. 기록 파일을 확인하세요."))
+            except Exception as exc:
+                post("run_journal_ready", (None, f"실행 기록 준비 실패 ({type(exc).__name__})"))
+            else:
+                post("run_journal_ready", (journal, None))
+
+        try:
+            threading.Thread(target=open_journal, name="kakao-run-journal", daemon=True).start()
+        except RuntimeError:
+            self.handle_run_journal_ready((None, "실행 기록 점검을 시작하지 못했습니다."))
+
+    def handle_run_journal_ready(self, payload) -> None:
+        if self._close_requested:
+            return
+        self.run_journal, self._journal_error = payload
+        self._journal_loading = False
+        self.refresh_primary_action_visual()
+        self.offer_run_recovery()
+
+    def report_callback_exception(self, exc_type, _value, tb) -> None:
+        # pythonw has no visible stderr. Keep just the most recent safe record.
+        frames = traceback.extract_tb(tb)
+        frame = frames[-1] if frames else None
+        stage = next((name for flag, name in (
+            ("_document_loading", "document_load"), ("_auto_match_loading", "matching"),
+            ("_send_confirmation_active", "confirmation"), ("active_run", "sending"),
+            ("_diagnostic_busy", "diagnostics"),
+        ) if self.__dict__.get(flag)), "idle")
+        try:
+            atomic_write_json(LOG_DIR / "gui-last-error.json", {
+                "stage": stage,
+                "type": exc_type.__name__,
+                "function": frame.name if frame else None,
+                "line": frame.lineno if frame else None,
+                "document_generation": self.__dict__.get("_document_load_generation", 0),
+            })
+        except (OSError, ValueError):
+            pass
+        if not self.__dict__.get("_close_requested"):
+            self.log("오류", f"화면 작업 실패 ({exc_type.__name__}) · 실행 기록 또는 현재 파일을 확인하세요.")
+
     def configure_style(self) -> None:
         self.colors, self.ui_line_height = configure_hub_style(self)
         self.preview_full_title_width = tkfont.Font(
             self, font=("Malgun Gothic", 11, "bold")
         ).measure("수신자 미리보기") + 6
 
+    def action_block(self, action: str, selected=()) -> str:
+        state = self.__dict__
+        worker = state.get("worker")
+        if state.get("_close_requested"):
+            return "종료 중"
+        if state.get("active_run") is not None or (worker is not None and worker.is_alive()):
+            return "실행 중"
+        if state.get("_auto_match_waiting_to_send") or state.get("_send_confirmation_active"):
+            return "발송 확인 중"
+        if action == "open":
+            return ""
+        if action == "diagnostics":
+            return "대상 확인 중" if state.get("_auto_match_loading") else ""
+        if state.get("_document_loading"):
+            return "파일 읽는 중"
+        if action in {"mode", "edit"}:
+            return ""
+        if action in {"mapping", "register"}:
+            if state.get("_auto_match_loading") or state.get("_diagnostic_busy"):
+                return "채팅방 확인 중"
+            if action == "mapping" and not state.get("rows"):
+                return "발송 목록 필요"
+            return ""
+        if state.get("_journal_loading"):
+            return "실행 기록 준비 중"
+        if action == "retry":
+            if state.get("_journal_error"):
+                return "실행 기록 확인 필요"
+            return "" if selected else "2차 전송 대상 없음"
+        if state.get("_restored_retry_only"):
+            return "2차 전송 대상"
+        if state.get("_journal_error"):
+            return "실행 기록 확인 필요"
+        if not selected:
+            return "발송 대상 없음"
+        if any(state.get(flag) for flag in ("_diagnostic_busy", "_auto_match_loading", "_file_match_failed")) and self.direct_names_for_selected(selected):
+            if state.get("_diagnostic_busy"):
+                return "연결 점검 중"
+            if state.get("_auto_match_loading"):
+                return "대상 확인 중"
+            if state.get("_file_match_failed"):
+                return "자동 매칭 다시 실행"
+        return ""
+
     def refresh_primary_action_visual(self, *_trace_args: str) -> None:
-        """Render existing run state; leave enabled state and callbacks alone."""
-        button = self.__dict__.get("start_button")
+        state = self.__dict__
+        button = state.get("start_button")
         if not isinstance(button, ttk.Button):
             return
-        preparing = bool(self.__dict__.get("_auto_match_waiting_to_send"))
-        running = self.__dict__.get("active_run") is not None
-        loading = bool(self.__dict__.get("_document_loading"))
-        appearance = (
-            "Busy.Accent.TButton" if preparing or running or loading else "Accent.TButton",
-            "준비 중" if preparing else "처리 중" if running else "파일 읽는 중" if loading else "발송 시작",
-        )
-        if self.__dict__.get("_primary_action_appearance") != appearance:
-            button.configure(style=appearance[0], text=appearance[1])
-            self._primary_action_appearance = appearance
+        try:
+            selected = self.filtered_rows()
+        except (ValueError, tk.TclError):
+            selected = ()
+        send_block = self.action_block("send", selected)
+        open_block = self.action_block("open")
+        history_block = "실행 기록 준비 중" if state.get("_journal_loading") else ""
+        diagnostics_block = self.action_block("diagnostics")
+        mapping_block = self.action_block("mapping")
+        register_block = self.action_block("register")
+        edit_block = self.action_block("edit")
+        retry_indexes = macro_retry_result_indexes(self.results, self.rows)
+        retry_block = self.action_block("retry", retry_indexes)
+        stoppable = any((state.get("_document_loading"), state.get("_auto_match_waiting_to_send"),
+                         state.get("active_run") is not None)) and not state.get("_close_requested")
+        presentation = (send_block, open_block, mapping_block, register_block, edit_block,
+                        retry_block, history_block, diagnostics_block, stoppable, len(retry_indexes))
+        if state.get("_primary_action_appearance") == (presentation, len(selected), state.get("_file_match_failed")):
+            return
+        self._primary_action_appearance = (presentation, len(selected), state.get("_file_match_failed"))
+        pending = send_block in {"파일 읽는 중", "대상 확인 중", "연결 점검 중", "발송 확인 중", "실행 중"}
+        button.configure(style="Busy.Accent.TButton" if pending else "Accent.TButton",
+                         text={"발송 확인 중": "준비 중", "실행 중": "처리 중"}.get(send_block,
+                              send_block if pending else "발송 시작"))
+        self.mapping_button.configure(text="다시 조회" if state.get("_file_match_failed") else "자동 매칭")
+        self.action_hint_var.set({
+            "발송 대상 없음": "CSV/XLSX를 열거나 발송 범위를 확인하세요.",
+            "자동 매칭 다시 실행": "대상을 확인하지 못했습니다. 자동 매칭을 다시 실행하세요.",
+            "2차 전송 대상": "직접 실패 2차 전송을 선택하세요.",
+        }.get(send_block, send_block) or f"{len(selected)}건 검토 가능")
+        for target, blocked in (
+            (button, send_block), (self.open_file_button, open_block),
+            (self.direct_toggle, edit_block), (self.test_one_check, edit_block),
+            (self.mapping_button, mapping_block), (self.manual_mapping_button, mapping_block),
+            (self.stop_button, not stoppable), (self.retry_failed_button, retry_block),
+            (self.register_contact_button, register_block), (self.history_button, history_block),
+            (self.diagnostics_button, diagnostics_block),
+        ):
+            target.state(["disabled"] if blocked else ["!disabled"])
+        for menu, label, blocked in (
+            (self.run_menu, "실행 시작", send_block), (self.run_menu, "직접 전송", edit_block),
+            (self.run_menu, "화면 좌표 설정", edit_block),
+            (self.run_menu, "자동 매칭", mapping_block), (self.run_menu, "수동 매칭", mapping_block),
+            (self.run_menu, "연락처 등록", register_block), (self.preview_menu, "이 대상 연결", register_block or not self.rows),
+            (self.run_menu, "직접 실패 2차 전송", retry_block), (self.run_menu, "즉시 중지", not stoppable),
+            (self.file_menu, "실행 기록 / 중단 작업 복원", history_block),
+            (self.help_menu, "연결 준비 점검 / 인증 복구", diagnostics_block),
+            *((self.file_menu, label, open_block) for label in ("파일 찾기", "다시 읽기", "예시 CSV 열기")),
+        ):
+            menu.entryconfigure(label, state="disabled" if blocked else "normal")
+        for menu in (self.edit_menu, self.preview_menu):
+            for label in ("행 추가", "행 복제", "행 삭제", "파일 첨부", "파일 초기화", "붙여넣기", "되돌리기", "큰 창 수정"):
+                menu.entryconfigure(label, state="disabled" if edit_block else "normal")
 
     def build_layout(self) -> None:
         self.option_add("*tearOff", False)
@@ -646,7 +785,10 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         self.diagnostics_button = ttk.Button(actions, text="연결 점검", command=self.open_connection_diagnostics, style="Compact.TButton")
         self.diagnostics_button.grid(row=0, column=4)
         self.file_path_label = KoreanLabel(command, textvariable=self.file_var, style="CommandMuted.TLabel", anchor="w")
-        self.file_path_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        self.file_path_label.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        self.action_hint_var = tk.StringVar()
+        KoreanLabel(command, textvariable=self.action_hint_var, style="CommandMuted.TLabel").grid(
+            row=1, column=1, sticky="e", pady=(5, 0))
 
         readiness = ttk.Frame(main, style="Card.TFrame", padding=(12, 8))
         self.readiness_frame = readiness
@@ -788,6 +930,8 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         self.mapping_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
         self.manual_mapping_button = ttk.Button(mapping_bar, text="수동 매칭", command=self.open_manual_chat_mapping, style="Secondary.TButton")
         self.manual_mapping_button.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        self.register_contact_button = ttk.Button(mapping_bar, text="연락처 등록", command=self.register_contact, style="Secondary.TButton")
+        self.register_contact_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         schedule_bar = ttk.Frame(settings, style="Surface.TFrame")
         schedule_bar.grid(row=4, column=0, sticky="ew", pady=(7, 0))
         schedule_bar.columnconfigure(0, weight=1)
@@ -1053,6 +1197,7 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         file_menu.add_separator()
         file_menu.add_command(label="로그 폴더 열기", command=self.open_log_folder)
         file_menu.add_command(label="실행 기록 / 중단 작업 복원", command=self.open_run_history)
+        self.file_menu = file_menu
         menubar.add_cascade(label="파일", menu=file_menu)
 
         edit_menu = tk.Menu(menubar, tearoff=False)
@@ -1069,12 +1214,15 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
             ("큰 창 수정", self.edit_selected_row),
         ):
             edit_menu.add_command(label=label, command=command)
+        self.edit_menu = edit_menu
         menubar.add_cascade(label="편집", menu=edit_menu)
 
         run_menu = tk.Menu(menubar, tearoff=False)
         run_menu.add_checkbutton(label="직접 전송", variable=self.direct_enabled_var, command=self.on_direct_mode_changed)
         run_menu.add_command(label="자동 매칭", command=self.open_chat_mapping)
         run_menu.add_command(label="수동 매칭", command=self.open_manual_chat_mapping)
+        run_menu.add_command(label="연락처 등록", command=self.register_contact)
+        self.run_menu = run_menu
         run_menu.add_separator()
         run_menu.add_command(label="화면 좌표 설정", command=self.capture_coordinate)
         run_menu.add_command(label="실행 시작", command=self.start_sending)
@@ -1085,6 +1233,7 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="도움말", command=self.show_help)
         help_menu.add_command(label="연결 준비 점검 / 인증 복구", command=self.open_connection_diagnostics)
+        self.help_menu = help_menu
         menubar.add_cascade(label="도움말", menu=help_menu)
         self.configure(menu=menubar)
         self.build_preview_menu()
@@ -1105,11 +1254,31 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         ):
             self.preview_menu.add_command(label=label, command=command)
 
+        self.preview_menu.add_command(label="이 대상 연결", command=self.register_selected_contact)
+
+    def register_contact(self) -> None:
+        if self.action_block("register"):
+            return
+        name = simpledialog.askstring("연락처 등록", "명단에 사용할 대화명을 입력하세요.", parent=self)
+        if name and name.strip():
+            self.open_manual_chat_mapping(target_names=(name.strip(),))
+
+    def register_selected_contact(self) -> None:
+        if self.action_block("register"):
+            return
+        selected = self.tree.selection()
+        if len(selected) == 1:
+            name = self.rows[int(selected[0])].chat_name.strip()
+            if name:
+                self.open_manual_chat_mapping(target_names=(name,))
+
     def show_preview_menu(self, event: tk.Event) -> str:
         item_id = self.tree.identify_row(event.y)
         if item_id and item_id not in self.tree.selection():
             self.tree.selection_set(item_id)
             self.tree.focus(item_id)
+        self.preview_menu.entryconfigure("이 대상 연결", state=(
+            "normal" if not self.action_block("register") and len(self.tree.selection()) == 1 else "disabled"))
         self.preview_menu.tk_popup(event.x_root, event.y_root)
         return "break"
 
@@ -1198,6 +1367,9 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         self.guarded_mapping_ids = tuple(self.direct_config.guarded_mapping_ids)
 
     def on_direct_mode_changed(self, persist: bool = True) -> None:
+        if persist and self.action_block("mode"):
+            self.direct_enabled_var.set(bool(self.direct_config.enabled))
+            return
         direct_enabled = bool(self.direct_enabled_var.get())
         if direct_enabled and persist and not self.direct_warning_confirmed:
             accepted = messagebox.askyesno(
@@ -1242,6 +1414,7 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
             names = self.direct_names_for_selected(tuple(enumerate(self.rows)))
             if names:
                 self.request_auto_chat_matches(names, reason="mode_enabled")
+        KakaoSenderApp.refresh_primary_action_visual(self)
 
     def _screen_use_is_active(self) -> bool:
         # Some shutdown tests (and defensive close paths) construct the app
@@ -1495,6 +1668,9 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         locked = bool(loading or self.__dict__.get("active_run") is not None
                       or self.__dict__.get("_auto_match_waiting_to_send"))
         self.set_attachment_edit_state(locked)
+        if isinstance(self.__dict__.get("start_button"), ttk.Button):
+            KakaoSenderApp.refresh_primary_action_visual(self)
+            return
         for name in ("start_button", "direct_toggle", "mapping_button", "manual_mapping_button"):
             widget = self.__dict__.get(name)
             if widget is not None:
@@ -1507,6 +1683,8 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
     def apply_loaded_document(self, document) -> None:
         """Commit one completed read on the Tk thread without reading again."""
         self.cancel_auto_chat_matches()
+        self._pending_file_match = None
+        self._file_match_failed = False
         self.file_path = document.source_path
         self.file_var.set(str(self.file_path))
         self.rows = list(document.rows)
@@ -1525,6 +1703,8 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         self.populate_table()
         self.refresh_preview_count()
         self.update_summary()
+        if status := self.__dict__.get("status_var"):
+            status.set("명단을 불러왔습니다.")
         scheduled_count = sum(1 for row in self.rows if row.scheduled_at is not None)
         schedule_note = f", 예약 {scheduled_count}건" if scheduled_count else ""
         self.log("확인", f"{self.file_path.name} 파일에서 {len(self.rows)}건{schedule_note}을 불러왔습니다.")
@@ -1536,33 +1716,15 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
                 # pyautogui, focus, click, hotkey, typing, or chat open/close
                 # can occur on this path.
                 self.request_auto_chat_matches(names, reason="file_load")
+        KakaoSenderApp.refresh_primary_action_visual(self)
 
     def document_change_locked(self) -> bool:
         """Keep one send result snapshot bound to the rows that created it."""
 
-        worker = self.__dict__.get("worker")
-        if (self.__dict__.get("active_run") is None
-                and not (worker is not None and worker.is_alive())
-                and not self.__dict__.get("_auto_match_waiting_to_send")):
-            return False
-        messagebox.showinfo(
-            "실행 결과 정리 중",
-            "현재 발송 실행의 결과 처리가 끝난 뒤 파일을 변경해 주세요.",
-        )
-        return True
+        return bool(self.action_block("open"))
 
     def preview_edit_locked(self) -> bool:
-        if self.__dict__.get("_document_loading"):
-            messagebox.showinfo("파일 읽는 중", "파일 읽기가 끝난 뒤 미리보기를 수정해 주세요. [중지]로 읽기를 취소할 수 있습니다.")
-            return True
-        worker = self.__dict__.get("worker")
-        if self.__dict__.get("active_run") is not None or (worker and worker.is_alive()):
-            messagebox.showinfo("실행 중", "발송 중에는 미리보기를 수정할 수 없습니다.")
-            return True
-        if getattr(self, "_auto_match_waiting_to_send", False):
-            messagebox.showinfo("채팅방 확인 중", "발송 직전 채팅방 확인이 끝난 뒤 미리보기를 수정해 주세요.")
-            return True
-        return False
+        return bool(self.action_block("edit"))
 
     def push_undo_snapshot(self) -> None:
         self.undo_stack.append(list(self.rows))
@@ -1593,6 +1755,7 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
             self.attachment_state_label.configure(text=attachment_count)
         self.refresh_schedule_state_label()
         self.refresh_delivery_routes()
+        KakaoSenderApp.refresh_primary_action_visual(self)
         if self.file_path:
             prefix = "기록 복원 · " if self.__dict__.get("_recovery_of") else ""
             self.file_var.set(prefix + str(self.file_path))
@@ -1855,11 +2018,7 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
 
     def retry_failed_rows(self) -> None:
         indexes = macro_retry_result_indexes(self.results, self.rows)
-        if not indexes:
-            messagebox.showinfo(
-                "2차 전송 대상 없음",
-                "PC 화면으로 다시 보낼 명시적인 직접 전송 실패 행이 없습니다.",
-            )
+        if self.action_block("retry", indexes):
             return
         self.log("2차 전송", f"직접 전송 실패 {len(indexes)}건을 PC 화면 방식으로 다시 발송합니다.")
         self.start_sending(indexes, send_mode="macro_retry")
@@ -1869,9 +2028,8 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
             return
         failed_count = len(macro_retry_result_indexes(self.results, self.rows))
         self.retry_failed_button.configure(text=format_retry_failed_button_label(failed_count))
-        worker = getattr(self, "worker", None)
-        worker_running = bool(worker and worker.is_alive())
-        self.retry_failed_button.state(["disabled"] if worker_running or not failed_count else ["!disabled"])
+        self.retry_failed_button.state(["disabled"] if self.action_block("retry", range(failed_count)) else ["!disabled"])
+        KakaoSenderApp.refresh_primary_action_visual(self)
 
     def pick_attachments(self, images_only: bool = False) -> tuple[Path, ...]:
         filetypes = (
@@ -2690,6 +2848,8 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         return True
 
     def capture_coordinate(self) -> None:
+        if self.action_block("edit"):
+            return
         self.update_idletasks()
         capture_geometry = self.geometry()
         capture_state = self.state()
@@ -2741,6 +2901,9 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         else:
             self._active_send_preparation_token = None
         self.set_attachment_edit_state(waiting)
+        if isinstance(self.__dict__.get("start_button"), ttk.Button):
+            KakaoSenderApp.refresh_primary_action_visual(self)
+            return
         stop_button = self.__dict__.get("stop_button")
         if stop_button is not None:
             stop_button.state(["!disabled"] if waiting else ["disabled"])
@@ -2838,7 +3001,18 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
             blocked_direct_names=unresolved,
         )
 
-    def start_sending_after_preflight(
+    def start_sending_after_preflight(self, selected, *, blocked_direct_names=(), send_mode="normal") -> None:
+        if self.action_block("open"):
+            return
+        self._send_confirmation_active = True
+        KakaoSenderApp.refresh_primary_action_visual(self)
+        try:
+            self._confirm_and_start_send(selected, blocked_direct_names=blocked_direct_names, send_mode=send_mode)
+        finally:
+            self._send_confirmation_active = False
+            KakaoSenderApp.refresh_primary_action_visual(self)
+
+    def _confirm_and_start_send(
         self,
         selected: list[tuple[int, MessageRow]],
         *,
@@ -2883,7 +3057,7 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
             "직접 전송 대상 확인" if direct_count else "발송 내용 확인",
             f"{route_text}{screen_note}\n\n{target_preview}\n\n미리보기의 수신자·본문·첨부를 확인했습니다. 계속할까요?",
         )
-        if not accepted:
+        if not accepted or self.__dict__.get("_close_requested"):
             self.status_var.set("발송 취소")
             self.run_row_indexes = None
             return
@@ -2922,7 +3096,16 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
             self.manual_mapping_button.state(["disabled"])
         self.stop_button.state(["!disabled"])
         self.worker = threading.Thread(target=self.send_worker, args=(request, supervisor), daemon=True)
-        self.worker.start()
+        try:
+            self.worker.start()
+        except RuntimeError as exc:
+            self.worker = None
+            self.active_run = None
+            self.run_row_indexes = None
+            self.started_at = None
+            self.restore_send_controls()
+            self.status_var.set("발송 실행을 시작하지 못했습니다. 다시 시도하세요.")
+            self.log("오류", f"발송 스레드 시작 실패 ({type(exc).__name__})")
 
     def start_sending(
         self,
@@ -2930,26 +3113,17 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         *,
         send_mode: str = "normal",
     ) -> None:
-        if self.__dict__.get("_document_loading"):
-            messagebox.showinfo("파일 읽는 중", "파일 읽기가 끝난 뒤 발송을 시작해 주세요.")
-            return
-        if self.__dict__.get("_diagnostic_busy"):
-            messagebox.showinfo("연결 점검 중", "연결 점검을 마친 뒤 발송을 시작해 주세요.")
-            return
-        if self.__dict__.get("_auto_match_waiting_to_send"):
-            messagebox.showinfo("발송 준비 중", "채팅방 확인을 기다리거나 [중지]로 준비를 취소해 주세요.")
-            return
-        if send_mode == "normal" and self.__dict__.get("_restored_retry_only"):
-            messagebox.showinfo("2차 전송 대기 복원", "이 명단은 직접 전송 실패 기록입니다. [직접 실패 2차 전송] 버튼으로 진행하세요.")
-            return
-        if self.active_run is not None or (self.worker and self.worker.is_alive()):
-            messagebox.showinfo("실행 중", "이미 발송 작업이 실행 중입니다.")
-            return
         if send_mode not in {"normal", "macro_retry"}:
-            messagebox.showerror("실행 오류", "지원하지 않는 발송 실행 방식입니다.")
+            return
+        if self.action_block("open") or self.__dict__.get("_document_loading"):
+            return
+        try:
+            selected = self.filtered_rows(row_indexes)
+        except (ValueError, tk.TclError):
+            return
+        if self.action_block("retry" if send_mode == "macro_retry" else "send", selected):
             return
         self.run_row_indexes = list(row_indexes) if row_indexes is not None else None
-        selected = self.filtered_rows(self.run_row_indexes)
         if send_mode == "normal" and bool(self.direct_enabled_var.get()):
             direct_names = self.direct_names_for_selected(selected)
             if direct_names:
@@ -2994,7 +3168,10 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
     def request_close(self) -> None:
         """Cancel an active run before allowing the Tk window to disappear."""
 
+        self._close_requested = True
+        self._active_send_preparation_token = None
         self.cancel_document_load()
+        self.cancel_auto_chat_matches()
         active_run = getattr(self, "active_run", None)
         if self._screen_use_is_active():
             self._close_requested = True

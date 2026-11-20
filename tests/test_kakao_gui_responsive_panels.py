@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import kakao_gui_panels as panels
 from kakao_sender import MessageRow
+from kakao_sender_gui import KakaoSenderApp
 
 
 class OwnerVar:
@@ -93,6 +94,7 @@ class OwnerWidget:
 
 
 class PanelApp(panels.HubRunPanelsMixin):
+    action_block = KakaoSenderApp.action_block
     def __init__(self, journal=None):
         self.run_journal = journal
         self.status_var = OwnerVar("준비")

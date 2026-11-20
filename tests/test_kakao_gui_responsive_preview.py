@@ -196,7 +196,7 @@ class ResponsivePreviewTests(unittest.TestCase):
         app.filtered_rows = Mock()
         with patch('kakao_sender_gui.messagebox.showinfo') as info:
             app.start_sending()
-            info.assert_called_once()
+            info.assert_not_called()
         app.filtered_rows.assert_not_called()
         app.stop_sending()
         app.cancel_document_load.assert_called_once()

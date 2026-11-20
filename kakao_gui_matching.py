@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 import tkinter as tk
 from tkinter import messagebox, ttk
 from kakao_send_service import row_uses_direct_send
@@ -719,16 +719,43 @@ def direct_send_target_preview(
     return len(direct_rows), tuple(lines)
 
 
+class AutoMatchResult(NamedTuple):
+    generation: int
+    reason: str
+    names: tuple[str, ...]
+    chats: list[dict[str, Any]] | None
+    error: AutoMatchFailure | None
+    callback: Callable[[bool], None] | None
+    pc_mappings: Mapping[Any, Any]
+    pc_mapping_labels: Mapping[Any, Any]
+    cancelled: bool
+    supplemental_warning: str | None
+    supplemental_failure: AutoMatchFailure | None
+    metrics: AutoMatchMetrics | None
+
+
 class HubChatMatchingMixin:
+    def resume_deferred_file_match(self) -> None:
+        reason = self.__dict__.pop("_pending_file_match", None)
+        if reason and not self.__dict__.get("_close_requested") and self.direct_enabled_var.get():
+            names = self.direct_names_for_selected(tuple(enumerate(self.rows)))
+            if names:
+                self.request_auto_chat_matches(names, reason=reason)
+        self.refresh_matching_controls()
+
+    def refresh_matching_controls(self) -> None:
+        if "action_hint_var" in self.__dict__:
+            self.refresh_primary_action_visual()
+
     def cancel_auto_chat_matches(self) -> None:
         """Invalidate an in-flight list read before the loaded rows change."""
 
-        cancel_event = getattr(self, "_auto_match_cancel_event", None)
+        cancel_event = self.__dict__.get("_auto_match_cancel_event")
         if cancel_event is not None:
             cancel_event.set()
-        self._auto_match_generation = int(getattr(self, "_auto_match_generation", 0)) + 1
+        self._auto_match_generation = int(self.__dict__.get("_auto_match_generation", 0)) + 1
         self._auto_match_loading = False
-        callback = getattr(self, "_auto_match_pending_callback", None)
+        callback = self.__dict__.get("_auto_match_pending_callback")
         self._auto_match_pending_callback = None
         if callback is not None:
             callback(False)
@@ -789,7 +816,13 @@ class HubChatMatchingMixin:
         already started.  ``on_complete`` is invoked on the Tk thread.
         """
 
+        if self.__dict__.get("_close_requested"):
+            return False
         if self.__dict__.get("_diagnostic_busy"):
+            if reason in {"file_load", "mode_enabled"}:
+                self._pending_file_match = reason
+                self.status_var.set("파일 확인 완료 · 연결 점검 후 대상 확인")
+                return False
             self.log("연결", "직접 연결 점검이 끝난 뒤 자동 매칭을 다시 실행해 주세요.")
             if on_complete is not None:
                 on_complete(False)
@@ -803,17 +836,17 @@ class HubChatMatchingMixin:
                 seen.add(normalized)
                 normalized_names.append(name)
 
-        previous_callback = getattr(self, "_auto_match_pending_callback", None)
+        previous_callback = self.__dict__.get("_auto_match_pending_callback")
         if getattr(self, "_auto_match_loading", False):
             # A newer file load or send request supersedes the older one.  Do
             # not leave its worker manipulating the PC UI after the result is
             # ignored by generation matching, even when the older request did
             # not have a completion callback (for example, file-load refresh).
             self._auto_match_pending_callback = None
-            previous_cancel_event = getattr(self, "_auto_match_cancel_event", None)
+            previous_cancel_event = self.__dict__.get("_auto_match_cancel_event")
             if previous_cancel_event is not None:
                 previous_cancel_event.set()
-            self._auto_match_generation = int(getattr(self, "_auto_match_generation", 0)) + 1
+            self._auto_match_generation = int(self.__dict__.get("_auto_match_generation", 0)) + 1
             if previous_callback is not None:
                 previous_callback(False)
         if not normalized_names:
@@ -821,9 +854,10 @@ class HubChatMatchingMixin:
                 on_complete(True)
             return False
 
-        self._auto_match_generation = int(getattr(self, "_auto_match_generation", 0)) + 1
+        self._auto_match_generation = int(self.__dict__.get("_auto_match_generation", 0)) + 1
         generation = self._auto_match_generation
         self._auto_match_loading = True
+        self.refresh_matching_controls()
         self._auto_match_pending_callback = on_complete
         cancel_event = threading.Event()
         self._auto_match_cancel_event = cancel_event
@@ -1152,7 +1186,7 @@ class HubChatMatchingMixin:
             )
             self.post(
                 "auto_match_result",
-                (
+                AutoMatchResult(
                     generation,
                     reason,
                     names_snapshot,
@@ -1168,7 +1202,15 @@ class HubChatMatchingMixin:
                 ),
             )
 
-        threading.Thread(target=worker, name="kakao-auto-chat-match", daemon=True).start()
+        try:
+            threading.Thread(target=worker, name="kakao-auto-chat-match", daemon=True).start()
+        except RuntimeError:
+            self.handle_auto_chat_match_result(AutoMatchResult(
+                generation, reason, names_snapshot, None,
+                AutoMatchFailure("worker_start_failed", "채팅방 조회를 시작하지 못했습니다.", "자동 매칭을 다시 실행하세요."),
+                on_complete, {}, {}, False, None, None, None,
+            ))
+            return False
         return True
 
 
@@ -1394,57 +1436,15 @@ class HubChatMatchingMixin:
     def handle_auto_chat_match_result(self, payload: Any) -> None:
         """Handle one generation-matched auto-match result on the Tk thread."""
 
-        supplemental_warning: str | None = None
-        supplemental_failure: AutoMatchFailure | None = None
-        metrics: AutoMatchMetrics | None = None
-        if len(payload) == 12 and isinstance(payload[11], AutoMatchMetrics):
-            metrics = payload[11]
-            payload = payload[:11]
-        if len(payload) == 6:
-            generation, reason, chat_names, chats, error, callback = payload
-            pc_mappings: Mapping[Any, Any] = {}
-            pc_mapping_labels: Mapping[Any, Any] = {}
-            cancelled = False
-        elif len(payload) == 7:
-            generation, reason, chat_names, chats, error, callback, pc_mappings = payload
-            pc_mapping_labels = {}
-            cancelled = False
-        elif len(payload) == 8:
-            generation, reason, chat_names, chats, error, callback, pc_mappings, pc_mapping_labels = payload
-            cancelled = False
-        elif len(payload) == 9:
-            generation, reason, chat_names, chats, error, callback, pc_mappings, pc_mapping_labels, cancelled = payload
-        elif len(payload) == 10:
-            (
-                generation,
-                reason,
-                chat_names,
-                chats,
-                error,
-                callback,
-                pc_mappings,
-                pc_mapping_labels,
-                cancelled,
-                supplemental_warning,
-            ) = payload
-        elif len(payload) == 11:
-            (
-                generation,
-                reason,
-                chat_names,
-                chats,
-                error,
-                callback,
-                pc_mappings,
-                pc_mapping_labels,
-                cancelled,
-                supplemental_warning,
-                supplemental_failure,
-            ) = payload
-        else:
-            self.log("자동 매칭", "형식이 잘못된 채팅방 조회 결과를 무시했습니다.")
-            return
-        if generation != getattr(self, "_auto_match_generation", 0):
+        if not isinstance(payload, AutoMatchResult):
+            if not 6 <= len(payload) <= len(AutoMatchResult._fields):
+                self.log("자동 매칭", "형식이 잘못된 채팅방 조회 결과를 무시했습니다.")
+                return
+            defaults = ({}, {}, False, None, None, None)
+            payload = AutoMatchResult(*payload, *defaults[len(payload) - 6:])
+        (generation, reason, chat_names, chats, error, callback, pc_mappings,
+         pc_mapping_labels, cancelled, supplemental_warning, supplemental_failure, metrics) = payload
+        if generation != getattr(self, "_auto_match_generation", 0) or self.__dict__.get("_close_requested"):
             return
 
         def log_metrics(apply_seconds: float = 0.0) -> None:
@@ -1467,9 +1467,10 @@ class HubChatMatchingMixin:
             )
 
         self._auto_match_loading = False
-        if callback is getattr(self, "_auto_match_pending_callback", None):
+        if callback is self.__dict__.get("_auto_match_pending_callback"):
             self._auto_match_pending_callback = None
         if cancelled:
+            self.refresh_matching_controls()
             log_metrics()
             self.status_var.set("자동 매칭 중단됨 · 현재 채팅방 정리를 마쳤습니다.")
             self.log("자동 매칭", f"{reason} 화면 사용을 중단하고 현재 채팅방 정리를 마쳤습니다.")
@@ -1477,6 +1478,9 @@ class HubChatMatchingMixin:
                 callback(False)
             return
         if error is not None or chats is None:
+            if reason in {"file_load", "mode_enabled", "auto_match"}:
+                self._file_match_failed = True
+            self.refresh_matching_controls()
             log_metrics()
             failure = (
                 error
@@ -1501,13 +1505,26 @@ class HubChatMatchingMixin:
                 callback(False)
             return
         apply_started = time.perf_counter()
-        success = self.apply_auto_chat_match_result(
-            tuple(chat_names),
-            list(chats),
-            reason=reason,
-            pc_mappings=pc_mappings,
-            pc_mapping_labels=pc_mapping_labels,
-        )
+        try:
+            success = self.apply_auto_chat_match_result(
+                tuple(chat_names),
+                list(chats),
+                reason=reason,
+                pc_mappings=pc_mappings,
+                pc_mapping_labels=pc_mapping_labels,
+            )
+        except Exception as exc:
+            if reason in {"file_load", "mode_enabled", "auto_match"}:
+                self._file_match_failed = True
+            self.refresh_matching_controls()
+            self.status_var.set("매칭 결과 반영 실패 · 자동 매칭을 다시 실행하세요.")
+            self.log("오류", f"매칭 결과 반영 실패 ({type(exc).__name__})")
+            if callback is not None:
+                callback(False)
+            return
+        if reason in {"file_load", "mode_enabled", "auto_match"}:
+            self._file_match_failed = not success
+        self.refresh_matching_controls()
         log_metrics(time.perf_counter() - apply_started)
         record_matching_diagnostic(
             reason, chat_names, self.__dict__.get("direct_mappings", {}),
@@ -1568,6 +1585,8 @@ class HubChatMatchingMixin:
         automation.
         """
 
+        if "action_hint_var" in self.__dict__ and self.action_block("mapping"):
+            return
         if getattr(self, "active_run", None) is not None or (
             getattr(self, "worker", None) is not None and self.worker.is_alive()
         ):
@@ -1603,6 +1622,8 @@ class HubChatMatchingMixin:
         verified two-person chat.
         """
 
+        if "action_hint_var" in self.__dict__ and self.action_block("register" if target_names is not None else "mapping"):
+            return
         if getattr(self, "active_run", None) is not None or (
             getattr(self, "worker", None) is not None and self.worker.is_alive()
         ):
@@ -1810,7 +1831,7 @@ class HubChatMatchingMixin:
         )
         unresolved = self.manual_mapping_unresolved_names(snapshot, target_names=target_scope)
         if not unresolved:
-            messagebox.showinfo("수동 매칭", "현재 파일의 모든 대화명이 매칭되고 최신 1:1 상태로 확인되었습니다.")
+            messagebox.showinfo("수동 매칭", "현재 대상이 최신 1:1 상태로 확인되었습니다.")
             if on_close is not None:
                 on_close()
             return
@@ -1826,7 +1847,7 @@ class HubChatMatchingMixin:
 
         ttk.Label(
             dialog,
-            text="CSV 대상과 실제 카카오 1:1 채팅을 직접 확인해 연결합니다.",
+            text="명단에서 사용할 이름과 실제 카카오 1:1 채팅을 연결합니다.",
             font=("Malgun Gothic", 11, "bold"),
         ).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 4))
         ttk.Label(
@@ -1961,7 +1982,7 @@ class HubChatMatchingMixin:
                 candidate_tree.delete(*candidate_tree.get_children())
                 candidate_loading = False
                 candidate_tree.state(["!disabled"])
-                candidate_status_var.set("미연결 CSV 대상을 선택하세요.")
+                candidate_status_var.set("연결할 이름을 선택하세요.")
                 return
             try:
                 rows_snapshot = tuple(self.rows)

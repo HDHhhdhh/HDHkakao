@@ -73,6 +73,11 @@ def isolated_gui_fixture(*, visible=False, geometry=(1024, 720), scaling=4 / 3, 
         stack.enter_context(patch("kakao_sender_gui.RunJournal", return_value=None))
         stack.enter_context(patch.object(KakaoSenderApp, "load_relaxed_config", return_value=copy.deepcopy(DEFAULT_CONFIG)))
         stack.enter_context(patch.object(KakaoSenderApp, "load_direct_config", return_value=DirectKakaoConfig(enabled=False)))
+        def finish_journal_fixture(app):
+            app._journal_loading = False
+            app.refresh_primary_action_visual()
+
+        stack.enter_context(patch.object(KakaoSenderApp, "initialize_run_journal", finish_journal_fixture))
         for method in ("offer_run_recovery", "drain_queue", "tick_elapsed", "tick_schedule_capacity"):
             stack.enter_context(patch.object(KakaoSenderApp, method))
         for method in ("showinfo", "showwarning", "showerror", "askyesno", "askyesnocancel"):
@@ -205,7 +210,84 @@ class GuiLayoutTests(unittest.TestCase):
             self.app.update()
         self.assertEqual(button.cget("style"), "Accent.TButton")
         self.assertEqual(button.cget("text"), "발송 시작")
-        self.assertTrue(button.instate(["!disabled"]))
+        self.assertTrue(button.instate(["disabled"]))  # Empty roster.
+
+    def test_early_file_selection_and_pending_match_block_both_send_entries(self):
+        app = self.app
+        self.assertTrue(app.open_file_button.instate(["!disabled"]))
+        self.assertEqual(app.run_menu.entrycget("실행 시작", "state"), "disabled")
+        app.direct_enabled_var.set(True)
+        try:
+            def hold_match(_names, *, reason):
+                self.assertEqual(reason, "file_load")
+                app._auto_match_loading = True
+
+            with patch.object(app, "request_auto_chat_matches", side_effect=hold_match):
+                with patch("kakao_sender_gui.filedialog.askopenfilename", return_value=str(self.document)):
+                    app.open_file_button.invoke()
+                request = self.pending_documents.pop()
+                app.handle_document_load_result((request.token, request.read(request.path), None))
+            self.assertTrue(app.start_button.instate(["disabled"]))
+            self.assertEqual(app.run_menu.entrycget("실행 시작", "state"), "disabled")
+            self.assertTrue(app.open_file_button.instate(["!disabled"]))
+            self.assertEqual(app.start_button.cget("text"), "대상 확인 중")
+            app.start_button.invoke()
+            app.run_menu.invoke("실행 시작")
+            app.start_sending.assert_not_called()
+        finally:
+            app._auto_match_loading = False
+            app.direct_enabled_var.set(False)
+            app.refresh_primary_action_visual()
+
+    def test_journal_preparation_keeps_file_selection_available(self):
+        app = self.app
+        app._journal_loading = True
+        app.refresh_primary_action_visual()
+        try:
+            self.assertTrue(app.open_file_button.instate(["!disabled"]))
+            self.assertTrue(app.history_button.instate(["disabled"]))
+            with patch("kakao_sender_gui.filedialog.askopenfilename", return_value=str(self.document)):
+                app.open_file_button.invoke()
+            request = self.pending_documents.pop()
+            app.handle_document_load_result((request.token, request.read(request.path), None))
+            self.assertEqual(len(app.rows), 3)
+            self.assertTrue(app.start_button.instate(["disabled"]))
+            with patch.object(app, "offer_run_recovery"):
+                app.handle_run_journal_ready((object(), None))
+            self.assertTrue(app.start_button.instate(["!disabled"]))
+        finally:
+            app._journal_loading = False
+            app.run_journal = None
+            app.refresh_primary_action_visual()
+
+    def test_latest_file_during_diagnostics_supplies_the_deferred_targets(self):
+        app = self.app
+        app.direct_enabled_var.set(True)
+        app._diagnostic_busy = True
+        try:
+            from kakao_sender import MessageRow
+            for name in ("이전 대상", "새 대상"):
+                app.apply_loaded_document(SimpleNamespace(
+                    source_path=self.document, rows=(MessageRow(2, name, "fixture"),),
+                ))
+            self.assertEqual(app._pending_file_match, "file_load")
+            app._diagnostic_busy = False
+            with patch.object(app, "request_auto_chat_matches") as request:
+                app.resume_deferred_file_match()
+                app.resume_deferred_file_match()
+            request.assert_called_once_with(("새 대상",), reason="file_load")
+        finally:
+            app._diagnostic_busy = False
+            app.direct_enabled_var.set(False)
+            app.refresh_primary_action_visual()
+
+    def test_register_contact_without_a_loaded_document(self):
+        app = self.app
+        self.assertEqual(app.rows, [])
+        self.assertTrue(app.register_contact_button.instate(["!disabled"]))
+        with patch("kakao_sender_gui.simpledialog.askstring", return_value=" 새 연락처 "):
+            app.register_contact_button.invoke()
+        app.open_manual_chat_mapping.assert_called_once_with(target_names=("새 연락처",))
 
     @staticmethod
     def descendants(widget):
