@@ -548,7 +548,7 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         self.on_direct_mode_changed(persist=False)
         self.apply_display_half_geometry()
         self.bind("<Configure>", self.schedule_layout_rebalance)
-        self.rebalance_layout()
+        self.schedule_layout_rebalance()
         self.refresh_coordinate_labels()
         self.log("대기", "파일 열기 → 자동 매칭/화면 좌표 설정 → 발송 시작 순서로 진행하세요.")
         self.surface_config_warning()
@@ -568,8 +568,6 @@ class KakaoSenderApp(HubChatMatchingMixin, HubRunFeedbackMixin, HubRunPanelsMixi
         height = max(self.min_window_size[1], min(round(960 * scale), int(self.winfo_screenheight() * 0.82)))
         width = min(width, self.winfo_screenwidth() - 80)
         height = min(height, self.winfo_screenheight() - 80)
-        self.geometry(f"{width}x{height}")
-        self.update_idletasks()
         self.geometry(f"{width}x{height}")
         self.release_size_constraints()
         # Native maximization respects the Windows taskbar and restore button.
