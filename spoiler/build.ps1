@@ -437,7 +437,7 @@ if (-not $SkipTests) {
         throw 'Grouped inbox UI contract tests failed.'
     }
 
-    foreach ($suite in @('RoomRenderingTests', 'DesignStateTests', 'InboxUiMergeTests', 'KoreanWrappingTests')) {
+    foreach ($suite in @('RoomRenderingTests', 'DesignStateTests', 'InboxUiMergeTests', 'KoreanWrappingTests', 'ResponsivenessTests')) {
         $suiteOutput = Join-Path $buildDirectory ('Spoiler.' + $suite + '.exe')
         $suiteMain = if ($suite -eq 'InboxUiMergeTests') { $suite } else { 'Spoiler.Tests.' + $suite }
         $suiteSources = @((Join-Path $testDirectory ($suite + '.cs')))

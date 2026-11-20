@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
@@ -46,6 +47,7 @@ namespace Spoiler
         private string _displayAccountId;
         private bool _visualsDirty;
         private bool _scopeTransition;
+        private bool _connectionReloading;
         private DateTime _lastRetentionCheckUtc = DateTime.UtcNow;
 
         private sealed class PendingPreview
@@ -102,13 +104,6 @@ namespace Spoiler
             }
             _source = demoMode || qaMode ? null : new LocoMessageSource(_vault);
             _replySource = replySource ?? _source;
-            // The receiver owns the durable inbox. No unscoped history is
-            // shown before the registered account has been established.
-            if (_source != null)
-            {
-                _items.AddRange(_source.LoadStoredMessages());
-                _displayAccountId = _source.CurrentAccountId;
-            }
             _uiBatchTimer = new System.Windows.Threading.DispatcherTimer(
                 System.Windows.Threading.DispatcherPriority.Background, Dispatcher);
             _uiBatchTimer.Interval = TimeSpan.FromMilliseconds(100);
@@ -732,38 +727,71 @@ namespace Spoiler
                 return;
             }
 
-            if (_vault.Load() == null)
-            {
-                _statusText.Text = "태블릿 보조기기를 등록해 주세요";
-                Dispatcher.BeginInvoke(new Action(OpenRegistration));
-                return;
-            }
-
-            _source.Start();
+            ReloadConnection(false);
         }
 
         private void ConnectOrRegister()
         {
-            if (_source == null)
+            ReloadConnection(true);
+        }
+
+        private async void ReloadConnection(bool reconnect)
+        {
+            if (_source == null || _scopeTransition || _connectionReloading || _exitRequested) return;
+
+            LocoCredentials credentials = _vault.Load();
+            if (credentials == null || !credentials.IsUsable)
             {
+                _statusText.Text = "태블릿 보조기기를 등록해 주세요";
+                await Dispatcher.BeginInvoke(new Action(OpenRegistration));
                 return;
             }
 
-            if (_vault.Load() == null)
-            {
-                OpenRegistration();
-                return;
-            }
+            if (!string.Equals(credentials.UserId.Trim(), _displayAccountId, StringComparison.Ordinal))
+                ResetDisplayedInbox(null);
 
-            _statusText.Text = "태블릿 보조기기에 다시 연결하는 중";
-            _source.Stop();
-            RefreshAccountScope();
-            _source.Start();
+            _connectionReloading = true;
+            _refreshButton.IsEnabled = false;
+            _refreshButton.IsPending = true;
+            _statusText.Text = reconnect ? "태블릿 보조기기에 다시 연결하는 중" : "저장된 대화를 여는 중";
+            UpdateReplyAvailability();
+            try
+            {
+                IList<NotificationPreview> stored = await Task.Run(delegate
+                {
+                    if (reconnect) _source.Stop();
+                    return _source.LoadStoredMessages();
+                });
+                if (_exitRequested) return;
+                ApplyStoredInbox(_source.CurrentAccountId, stored);
+                _statusText.Text = "태블릿 보조기기에 연결하는 중";
+                await Task.Run(new Action(_source.Start));
+            }
+            catch (Exception)
+            {
+                if (!_exitRequested)
+                {
+                    if (!string.Equals(_displayAccountId, _source.CurrentAccountId, StringComparison.Ordinal))
+                        ResetDisplayedInbox(null);
+                    _statusText.Text = "연결을 준비하지 못했어요. 새로고침으로 다시 시도하세요.";
+                }
+            }
+            finally
+            {
+                _connectionReloading = false;
+                if (!_exitRequested)
+                {
+                    _refreshButton.IsEnabled = true;
+                    _refreshButton.IsPending = false;
+                    UpdateReplyAvailability();
+                    FlushPendingUi();
+                }
+            }
         }
 
         private void OpenRegistration()
         {
-            if (_source == null || !IsLoaded)
+            if (_source == null || !IsLoaded || _connectionReloading || _exitRequested)
             {
                 return;
             }
@@ -934,13 +962,21 @@ namespace Spoiler
             {
                 return;
             }
-            ResetDisplayedInbox(_source.CurrentAccountId);
             IList<NotificationPreview> stored = _source.LoadStoredMessages();
-            if (!string.Equals(_displayAccountId, _source.CurrentAccountId, StringComparison.Ordinal))
-            {
-                ResetDisplayedInbox(_source.CurrentAccountId);
-            }
-            _items.AddRange(stored.Where(IsCurrentPreview));
+            ApplyStoredInbox(_source.CurrentAccountId, stored);
+        }
+
+        private void ApplyStoredInbox(string accountId, IList<NotificationPreview> stored)
+        {
+            if (!string.Equals(_displayAccountId, accountId, StringComparison.Ordinal))
+                ResetDisplayedInbox(accountId);
+            List<NotificationPreview> retained = InboxUiMerge.Merge(
+                new NotificationPreview[0],
+                stored.Where(item => string.Equals(item.AccountId, accountId, StringComparison.Ordinal)).ToList());
+            if (_items.SequenceEqual(retained)) return;
+            _items.Clear();
+            _items.AddRange(retained);
+            UpdateSearchFeedback();
             RenderList(false);
         }
 
@@ -968,7 +1004,7 @@ namespace Spoiler
         // succeeded in the receiver before an item reaches this queue.
         internal void FlushPendingUi()
         {
-            if (_scopeTransition || _exitRequested)
+            if (_scopeTransition || _connectionReloading || _exitRequested)
             {
                 return;
             }
@@ -1114,6 +1150,7 @@ namespace Spoiler
 
         private void OnClearHistory(object sender, RoutedEventArgs args)
         {
+            if (_connectionReloading) return;
             MessageBoxResult answer = MessageBox.Show(
                 this,
                 "Spoiler에 암호화해 둔 메시지 기록을 모두 지울까요?\n카카오톡의 원본 대화에는 영향을 주지 않습니다.",
@@ -1141,6 +1178,7 @@ namespace Spoiler
 
         internal bool ClearDisplayedHistory()
         {
+            if (_connectionReloading) return false;
             // Invalidate queued updates before the receiver stops and clears
             // its inbox; callbacks from the previous generation cannot replay.
             lock (_pendingSync)
@@ -1153,14 +1191,7 @@ namespace Spoiler
             {
                 return false;
             }
-            if (_source != null)
-            {
-                RefreshAccountScope();
-            }
-            else
-            {
-                ResetDisplayedInbox(_displayAccountId);
-            }
+            ResetDisplayedInbox(_source == null ? _displayAccountId : _source.CurrentAccountId);
             return true;
         }
 

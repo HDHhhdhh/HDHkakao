@@ -96,13 +96,13 @@ namespace Spoiler.Tests
         public static void WaitForReply(MainWindow window)
         {
             Stopwatch timeout = Stopwatch.StartNew();
-            while (Get<bool>(window, "_replyPending") && timeout.ElapsedMilliseconds < 2500)
+            while ((Get<string>(window, "_pendingReplyRoomKey") != null) && timeout.ElapsedMilliseconds < 2500)
             {
                 Pump(window);
                 Thread.Sleep(2);
             }
             Pump(window);
-            if (Get<bool>(window, "_replyPending")) throw new InvalidOperationException("The synthetic reply UI did not complete.");
+            if ((Get<string>(window, "_pendingReplyRoomKey") != null)) throw new InvalidOperationException("The synthetic reply UI did not complete.");
         }
 
         public static object Invoke(object target, string name, params object[] args)

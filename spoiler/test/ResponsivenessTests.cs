@@ -44,6 +44,7 @@ namespace Spoiler.Tests
                     Run("draft search scroll and filter continuity", InteractionContinuity);
                     Run("queued account and closed-window boundaries", QueuedBoundaries);
                     Run("composer busy and focus controls", ComposerStates);
+                    Run("same-account reconnect keeps drafts and filters", ReconnectPreservesWork);
                 }
                 Run("1000-message callback and settled-layout measurements", Benchmark);
                 Console.WriteLine("RESPONSIVENESS_CHECKS=" + _checks + " FAILURES=" + _failures + " BENCHMARK_ONLY=" + benchmarkOnly);
@@ -261,6 +262,39 @@ namespace Spoiler.Tests
                 Check(source.Calls == 0, "Account transition or close invoked a reply transport.");
             }
             finally { if (!RoomUiFixtures.Get<bool>(window, "_exitRequested")) window.Close(); }
+        }
+
+        private static void ReconnectPreservesWork()
+        {
+            FakeReplySource source = new FakeReplySource();
+            MainWindow window = Window(source);
+            try
+            {
+                List<NotificationPreview> stored = new List<NotificationPreview>(RoomUiFixtures.Messages());
+                foreach (NotificationPreview preview in stored) preview.AccountId = "fixture-account";
+                RoomUiFixtures.Invoke(window, "ApplyStoredInbox", "fixture-account", stored);
+                Select(window, "101");
+                TextBox input = RoomUiFixtures.Find<TextBox>(window, "ReplyInput");
+                TextBox search = RoomUiFixtures.Find<TextBox>(window, "RoomSearchInput");
+                input.Text = "보관할 초안";
+                search.Text = stored.First(preview => preview.ChatId == "101").RoomTitle;
+                RoomUiFixtures.Pump(window);
+                string query = search.Text;
+                string key = RoomUiFixtures.Get<string>(window, "_selectedRoomKey");
+                NotificationPreview incoming = RoomUiFixtures.Message("reconnect", "101", query, "Writer", "New", DateTime.Now, false);
+                incoming.AccountId = "fixture-account";
+                stored.Add(incoming);
+                RoomUiFixtures.Invoke(window, "ApplyStoredInbox", "fixture-account", stored);
+                RoomUiFixtures.Pump(window);
+                Check(input.Text == "보관할 초안" && search.Text == query &&
+                    RoomUiFixtures.Get<string>(window, "_selectedRoomKey") == key,
+                    "Refreshing the same account discarded the room, draft or filter.");
+                RoomUiFixtures.Invoke(window, "ApplyStoredInbox", "other-account", stored);
+                Check(input.Text.Length == 0 && search.Text.Length == 0 && Items(window).Count == 0,
+                    "A different account received the old draft or messages.");
+                Check(source.Calls == 0, "Refreshing the inbox sent a reply.");
+            }
+            finally { window.Close(); }
         }
 
         private static void ComposerStates()

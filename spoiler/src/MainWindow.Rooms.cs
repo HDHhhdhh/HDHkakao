@@ -23,7 +23,7 @@ namespace Spoiler
         private readonly Dictionary<string, string> _roomDrafts = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<string, string> _roomReplyFeedback = new Dictionary<string, string>(StringComparer.Ordinal);
         private bool _updatingRoomList;
-        private bool _replyPending;
+        private string _pendingReplyRoomKey;
         private ListBox _roomList;
         private TextBox _roomSearchInput;
         private TextBox _replyInput;
@@ -108,13 +108,24 @@ namespace Spoiler
             ChatRoom room = _rooms.FirstOrDefault(value => value.Key == _selectedRoomKey);
             bool stable = room != null && room.HasStableIdentity;
             bool sameAccount = !_scopeTransition && (_source == null || string.Equals(_displayAccountId, _source.CurrentAccountId, StringComparison.Ordinal));
-            bool available = stable && sameAccount && _replySource != null && _replySource.CanReply;
+            bool available = stable && sameAccount && !_connectionReloading && _replySource != null && _replySource.CanReply;
+            bool sendingHere = _pendingReplyRoomKey != null && _pendingReplyRoomKey == _selectedRoomKey;
             _replyInput.IsEnabled = stable && sameAccount;
-            _sendReplyButton.IsEnabled = available && !_replyPending && !string.IsNullOrWhiteSpace(_replyInput.Text);
-            _sendReplyButton.Content = _replyPending ? "전송 중" : "전송";
-            _sendReplyButton.IsPending = _replyPending;
+            _sendReplyButton.IsEnabled = available && _pendingReplyRoomKey == null && !string.IsNullOrWhiteSpace(_replyInput.Text);
+            _sendReplyButton.Content = sendingHere ? "전송 중" : "전송";
+            _sendReplyButton.IsPending = sendingHere;
             _sendReplyButton.ToolTip = room == null ? "대화방을 선택하세요." : !stable ? "기존 기록은 대화방 ID가 없어 읽기만 가능합니다. 같은 방의 새 메시지를 수신한 뒤 답장할 수 있습니다." : !available ? "태블릿 수신 연결이 준비되면 직접 답장할 수 있습니다." : "선택한 대화방에 직접 전송 (Ctrl+Enter)";
-            if (room != null && !stable) _replyFeedback.Text = "기존 기록은 읽기 전용입니다. 대화방 ID가 있는 새 메시지부터 답장할 수 있어요.";
+            string feedback;
+            if (room != null && !stable)
+                _replyFeedback.Text = "기존 기록은 읽기 전용입니다.";
+            else if (room != null && _roomReplyFeedback.TryGetValue(room.Key, out feedback))
+                _replyFeedback.Text = feedback;
+            else if (room != null && _pendingReplyRoomKey != null)
+                _replyFeedback.Text = "다른 대화방의 전송을 확인하는 중 · 초안 작성 가능";
+            else if (room != null && !available)
+                _replyFeedback.Text = "수신 연결 준비 중 · 초안 작성 가능";
+            else
+                _replyFeedback.Text = "Enter 줄바꿈 · Ctrl+Enter 전송";
         }
 
         private void SendSelectedReply()
@@ -128,7 +139,7 @@ namespace Spoiler
             string text = _replyInput.Text;
             int generation = _uiGeneration;
             string accountId = _displayAccountId;
-            _replyPending = true;
+            _pendingReplyRoomKey = roomKey;
             SetRoomReplyFeedback(roomKey, "전송 중… 결과를 확인하기 전에는 다시 보내지 마세요.");
             UpdateReplyAvailability();
             Task<ReplySendResult> send;
@@ -149,7 +160,7 @@ namespace Spoiler
         private void CompleteRoomReply(string roomKey, string sentText, int generation, string accountId, ReplySendResult result)
         {
             if (_exitRequested || generation != _uiGeneration || !string.Equals(accountId, _displayAccountId, StringComparison.Ordinal)) return;
-            _replyPending = false;
+            _pendingReplyRoomKey = null;
             bool validReceipt = result != null && result.Status == ReplySendStatus.Sent
                 && ChatRoomGrouping.CreateServerRoomKey(result.ChatId) == roomKey
                 && !string.IsNullOrWhiteSpace(result.LogId);
@@ -180,7 +191,7 @@ namespace Spoiler
             _selectedRoomKey = null;
             _roomDrafts.Clear();
             _roomReplyFeedback.Clear();
-            _replyPending = false;
+            _pendingReplyRoomKey = null;
             if (_replyInput != null) _replyInput.Clear();
             if (_roomSearchInput != null) _roomSearchInput.Clear();
         }
